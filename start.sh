@@ -16,7 +16,7 @@ echo "════════════════════════�
 
 # Khởi chạy Node.js server ở background
 cd /opt/bgutil/server
-node build/main.js &
+node build/main.js --port ${BGUTIL_PORT:-4416} &
 BGUTIL_PID=$!
 echo "bgutil PID: $BGUTIL_PID"
 
