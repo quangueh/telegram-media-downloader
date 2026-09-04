@@ -17,13 +17,14 @@ from telegram.ext import (
     filters,
 )
 
-from config import BOT_TOKEN, REQUEST_TIMEOUT, PORT, logger
+from config import BOT_TOKEN, REQUEST_TIMEOUT, PORT, logger, DOWNLOAD_DIR
 from downloader import (
     extract_and_download,
     VideoTooLargeError,
     VideoDownloadError,
     YOUTUBE_PLAYER_CLIENTS,
 )
+from image_processor import enhance_image, beautify_image
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ADMIN — Theo dõi user nào gửi link nào
@@ -53,6 +54,12 @@ def _log_activity(
         "status": status,
     })
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  IMAGE PROCESSING — User mode tracking
+# ═══════════════════════════════════════════════════════════════════════════════
+# _user_mode[user_id] = "enhance" | "beautify" | None
+_user_mode: dict = {}
+
 # Regex phát hiện URL trong tin nhắn văn bản
 URL_REGEX = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
@@ -62,12 +69,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = update.effective_user
     greeting = (
         f"👋 Xin chào <b>{html.escape(user.first_name if user else 'Bạn')}</b>!\n\n"
-        "🤖 Tôi là <b>Media Downloader Bot</b> chuyên tải video chất lượng cao từ:\n"
+        "🤖 Tôi là <b>Media Downloader Bot</b> chuyên:\n"
         "• 🎵 <b>TikTok</b> (Tự động xóa Watermark / Logo)\n"
         "• 📘 <b>Facebook</b> (Chất lượng HD cao nhất)\n"
         "• 📺 <b>YouTube</b> (Video kèm âm thanh đầy đủ)\n\n"
-        "📌 <b>Cách sử dụng:</b> Đơn giản chỉ cần sao chép và gửi trực tiếp link video vào đây!\n\n"
-        "⚠️ <i>Lưu ý: Telegram Bot tiêu chuẩn giới hạn file gửi tối đa <b>50MB</b>.</i>"
+        "🖼️ <b>Xử lý ảnh:</b>\n"
+        "• 🔍 /enhance — Làm nét ảnh (sharpen + tăng màu)\n"
+        "• ✨ /beautify — Làm đẹp ảnh (mịn da + sáng + hồng)\n\n"
+        "📌 <b>Cách sử dụng:</b>\n"
+        "• Gửi link video → tải tự động\n"
+        "• Gõ /enhance hoặc /beautify → gửi ảnh → nhận ảnh đã xử lý\n\n"
+        "⚠️ <i>Lưu ý: Telegram Bot giới hạn file tối đa <b>50MB</b>.</i>"
     )
     if update.message:
         await update.message.reply_text(greeting, parse_mode=ParseMode.HTML)
@@ -148,6 +160,135 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         text = text[:3990] + "\n..."
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  IMAGE PROCESSING — /enhance & /beautify
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def enhance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Kích hoạt chế độ làm nét — user gửi ảnh tiếp theo sẽ được xử lý."""
+    if not update.message:
+        return
+    user_id = update.effective_user.id
+    _user_mode[user_id] = "enhance"
+    await update.message.reply_text(
+        "🔍 <b>CHẾ ĐỘ LÀM NÉT ẢNH</b>\n\n"
+        "📸 Gửi ảnh cần làm nét!\n"
+        "⏳ Ảnh sẽ được sharpen + tăng màu sắc tự động.\n\n"
+        "❌ Gõ /cancel để hủy.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def beautify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Kích hoạt chế độ làm đẹp — user gửi ảnh tiếp theo sẽ được xử lý."""
+    if not update.message:
+        return
+    user_id = update.effective_user.id
+    _user_mode[user_id] = "beautify"
+    await update.message.reply_text(
+        "✨ <b>CHẾ ĐỘ LÀM ĐẸP ẢNH</b>\n\n"
+        "📸 Gửi ảnh cần làm đẹp!\n"
+        "⏳ Ảnh sẽ được mịn da + sáng + tông hồng ấm tự động.\n\n"
+        "❌ Gõ /cancel để hủy.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Hủy chế độ xử lý ảnh."""
+    if not update.message:
+        return
+    user_id = update.effective_user.id
+    if user_id in _user_mode:
+        del _user_mode[user_id]
+        await update.message.reply_text("✅ Đã hủy chế độ xử lý ảnh.")
+    else:
+        await update.message.reply_text("Không có chế độ nào đang актив.")
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Xử lý ảnh gửi từ user — làm nét hoặc làm đẹp tùy chế độ."""
+    if not update.message or not update.message.photo:
+        return
+
+    user = update.effective_user
+    user_id = user.id if user else 0
+    mode = _user_mode.get(user_id)
+
+    if not mode:
+        return  # User không ở chế độ nào → bỏ qua
+
+    # Xóa mode ngay sau khi nhận ảnh
+    del _user_mode[user_id]
+
+    chat_id = update.effective_chat.id
+    status_msg = None
+    input_path = None
+    output_path = None
+
+    try:
+        # Gửi tin nhắn đang xử lý
+        mode_text = "làm nét" if mode == "enhance" else "làm đẹp"
+        status_msg = await update.message.reply_text(
+            f"🖌️ <b>Đang {mode_text} ảnh...</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
+
+        # Tải ảnh lớn nhất (photo[0] là lớn nhất trong Telegram)
+        photo = update.message.photo[-1]
+        photo_file = await context.bot.get_file(photo.file_id)
+
+        unique_id = __import__("uuid").uuid4().hex[:8]
+        input_path = str(DOWNLOAD_DIR / f"img_in_{unique_id}.jpg")
+        output_path = str(DOWNLOAD_DIR / f"img_out_{unique_id}.jpg")
+
+        await photo_file.download_to_drive(input_path)
+
+        # Xử lý ảnh
+        if mode == "enhance":
+            enhance_image(input_path, output_path)
+        else:
+            beautify_image(input_path, output_path)
+
+        # Gửi ảnh đã xử lý
+        with open(output_path, "rb") as f:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=f,
+                caption=f"{'🔍' if mode == 'enhance' else '✨'} Ảnh đã được {mode_text}!",
+            )
+
+        # Xóa tin nhắn trạng thái
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+        logger.info(f"Image {mode} thành công: user={user_id}")
+
+    except Exception as e:
+        logger.error(f"Lỗi xử lý ảnh {mode}: {e}", exc_info=True)
+        error_text = f"❌ Không thể {mode_text} ảnh. Vui lòng thử lại với ảnh khác!"
+        if status_msg:
+            try:
+                await status_msg.edit_text(error_text)
+            except Exception:
+                pass
+        else:
+            await update.message.reply_text(error_text)
+
+    finally:
+        # Dọn dẹp file tạm
+        for path in [input_path, output_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
 
 async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -383,6 +524,14 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("enhance", enhance_command))
+    application.add_handler(CommandHandler("beautify", beautify_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+
+    # Đăng ký Photo Handler — bắt ảnh trước khi URL handler
+    application.add_handler(
+        MessageHandler(filters.PHOTO, handle_photo)
+    )
 
     # Đăng ký Message Handler bắt link HTTP/HTTPS
     application.add_handler(
