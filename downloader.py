@@ -28,8 +28,9 @@ TIKTOK_FALLBACK_API = "https://www.tikwm.com/api/"
 
 # Player client YouTube không yêu cầu PO Token — bypass "Sign in to confirm you're not a bot"
 # trên IP datacenter (Render, Railway, Koyeb,...)
-# tv: GVS_PO_TOKEN_POLICY=required=False; visionos: tương tự; android_vr: player_token_required=False
-YOUTUBE_PLAYER_CLIENTS = ["tv", "visionos", "android_vr"]
+# Test thực tế 2026-09-04: visionos hoạt động đầy đủ (43 formats, 1080p),
+# android_vr chỉ 360p, tv bị "The page needs to be reloaded"
+YOUTUBE_PLAYER_CLIENTS = ["visionos", "android_vr", "tv"]
 
 
 class DownloaderError(Exception):
