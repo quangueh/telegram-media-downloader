@@ -14,9 +14,9 @@ echo "════════════════════════�
 echo " Starting bgutil PO-token server on port ${BGUTIL_PORT:-4416}..."
 echo "══════════════════════════════════════════════════════════════════"
 
-# Khởi chạy Node.js server ở background
+# Khởi chạy Node.js server ở background (giới hạn 64MB heap để vừa 512MB RAM)
 cd /opt/bgutil/server
-node build/main.js --port ${BGUTIL_PORT:-4416} &
+node --max-old-space-size=64 build/main.js --port ${BGUTIL_PORT:-4416} &
 BGUTIL_PID=$!
 echo "bgutil PID: $BGUTIL_PID"
 
