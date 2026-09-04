@@ -3,6 +3,3 @@ yt-dlp>=2024.08.06
 aiofiles>=23.2.1
 python-dotenv>=1.0.1
 httpx>=0.27
-# bgutil-ytdlp-pot-provider: Plugin tự phát hiện PO-token server tại 127.0.0.1:4416
-# Server Node.js được build trong Dockerfile (opt/bgutil/server/build/main.js)
-bgutil-ytdlp-pot-provider>=1.0.0
