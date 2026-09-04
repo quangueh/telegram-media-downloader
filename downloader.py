@@ -1,11 +1,23 @@
 import os
+import re
 import uuid
 import asyncio
 from pathlib import Path
 from typing import Tuple, Optional, Union
+
+import httpx
 import yt_dlp
 
 from config import MAX_FILE_SIZE, DOWNLOAD_DIR, logger
+
+
+# Pattern nhận diện liên kết TikTok (bao gồm liên kết rút gọn vm.tiktok.com / vt.tiktok.com)
+TIKTOK_URL_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/[^\s]+", re.IGNORECASE
+)
+
+# API công cộng trả về stream TikTok không watermark (dự phòng khi yt-dlp bị TikTok chặn IP datacenter)
+TIKTOK_FALLBACK_API = "https://www.tikwm.com/api/"
 
 
 class DownloaderError(Exception):
@@ -26,6 +38,95 @@ class VideoTooLargeError(DownloaderError):
 class VideoDownloadError(DownloaderError):
     """Lỗi khi không thể tải hoặc xử lý video bằng yt-dlp."""
     pass
+
+
+def _is_tiktok_url(url: str) -> bool:
+    """Kiểm tra liên kết có phải TikTok hay không (hỗ trợ cả liên kết rút gọn)."""
+    return bool(TIKTOK_URL_PATTERN.search(url))
+
+
+async def _download_tiktok_fallback(
+    url: str, output_dir: Path
+) -> Optional[Tuple[str, str, int]]:
+    """
+    Dự phòng tải video TikTok qua API công khai tikwm.com khi yt-dlp bị chặn.
+
+    Returns:
+        Optional[Tuple[str, str, int]]: (file_path, title, duration), hoặc None nếu API không khả dụng.
+    """
+    match = TIKTOK_URL_PATTERN.search(url)
+    if not match:
+        return None
+
+    # Chuẩn hóa liên kết rút gọn (vm./vt.) thành dạng đầy đủ để API parse chính xác
+    tiktok_url = match.group(0)
+    if "vm.tiktok.com" in tiktok_url or "vt.tiktok.com" in tiktok_url:
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+                resp = await client.get(tiktok_url)
+                tiktok_url = str(resp.url)
+        except Exception as e:
+            logger.warning(f"Không thể mở rộng liên kết rút gọn TikTok {tiktok_url}: {e}")
+
+    payload = {"url": tiktok_url, "hd": "1"}
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(TIKTOK_FALLBACK_API, data=payload)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.warning(f"TikTok fallback API không phản hồi: {e}")
+        return None
+
+    if data.get("code") != 0 or not data.get("data"):
+        logger.warning(f"TikTok fallback API trả về lỗi: {data.get('msg')}")
+        return None
+
+    info = data["data"]
+    video_url = info.get("hdplay") or info.get("play")
+    if not video_url:
+        return None
+
+    title = (info.get("title") or "Video TikTok").strip() or "Video TikTok"
+    duration = int(info.get("duration") or 0)
+
+    # Từ chối sớm nếu API cung cấp sẵn dung lượng và vượt giới hạn Telegram
+    estimated_size = info.get("size") or 0
+    if isinstance(estimated_size, (int, float)) and estimated_size > MAX_FILE_SIZE:
+        raise VideoTooLargeError(int(estimated_size), MAX_FILE_SIZE)
+
+    # Tải stream mp4 (đã không watermark) về thư mục tạm
+    target_dir = output_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    unique_id = uuid.uuid4().hex[:10]
+
+    # Sanitize tiêu đề để dùng làm tên file an toàn trên Linux/Windows
+    safe_title = re.sub(r'[\\/:*?"<>|\n\r\t]+', " ", title)[:50].strip() or "tiktok"
+    file_path = target_dir / f"{safe_title}_{unique_id}.mp4"
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(120, connect=15), follow_redirects=True
+        ) as client:
+            async with client.stream("GET", video_url) as stream:
+                stream.raise_for_status()
+                downloaded = 0
+                with open(file_path, "wb") as f:
+                    async for chunk in stream.aiter_bytes(chunk_size=1 << 16):
+                        downloaded += len(chunk)
+                        if downloaded > MAX_FILE_SIZE:
+                            raise VideoTooLargeError(downloaded, MAX_FILE_SIZE)
+                        f.write(chunk)
+    except VideoTooLargeError:
+        _cleanup_leftovers(target_dir, unique_id)
+        raise
+    except Exception as e:
+        _cleanup_leftovers(target_dir, unique_id)
+        logger.warning(f"Tải stream TikTok fallback thất bại: {e}")
+        return None
+
+    logger.info(f"Tải thành công qua TikTok fallback API: {file_path}")
+    return str(file_path), title, duration
 
 
 def _cleanup_leftovers(directory: Path, unique_id: str) -> None:
@@ -145,6 +246,8 @@ def _sync_extract_and_download(url: str, output_dir: Union[str, Path]) -> Tuple[
         err_msg = str(e).lower()
         if "file is larger than max-filesize" in err_msg or "larger than max_filesize" in err_msg:
             raise VideoTooLargeError(MAX_FILE_SIZE + 1, MAX_FILE_SIZE)
+        # Log đầy đủ lỗi yt-dlp để debug trên Render (IP bị chặn, extractor lỗi thời,...)
+        logger.error(f"yt-dlp tải thất bại cho {url}: {e}")
         raise VideoDownloadError(f"Lỗi tải video từ nền tảng: {e}")
     except VideoTooLargeError:
         _cleanup_leftovers(target_dir, unique_id)
@@ -169,7 +272,22 @@ async def extract_and_download(
         Tuple[str, str, int]: (file_path, title, duration)
     """
     target_dir = Path(output_path) if output_path else DOWNLOAD_DIR
+
+    # Thử tải bằng yt-dlp trước; nếu là TikTok và yt-dlp bị chặn thì dùng API dự phòng
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None, _sync_extract_and_download, url, target_dir
-    )
+    try:
+        return await loop.run_in_executor(
+            None, _sync_extract_and_download, url, target_dir
+        )
+    except VideoTooLargeError:
+        raise
+    except (VideoDownloadError, Exception) as e:
+        if _is_tiktok_url(url):
+            logger.warning(
+                f"yt-dlp thất bại với TikTok ({e}), chuyển sang API dự phòng tikwm.com..."
+            )
+            fallback_result = await _download_tiktok_fallback(url, target_dir)
+            if fallback_result:
+                return fallback_result
+            raise
+        raise

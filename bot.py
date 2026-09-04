@@ -133,8 +133,13 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     except VideoDownloadError as e:
         logger.error(f"Lỗi tải video {url}: {e}")
+        # Hiển thị phần lỗi gốc để người dùng và dev biết nguyên nhân thật (IP bị chặn, extractor lỗi...)
+        reason = str(e).replace("Lỗi tải video từ nền tảng: ", "").strip()
+        if len(reason) > 300:
+            reason = reason[:300] + "..."
         error_text = (
             "❌ <b>Không thể tải video từ liên kết này!</b>\n\n"
+            f"<i>Chi tiết: {html.escape(reason)}</i>\n\n"
             "Vui lòng kiểm tra lại:\n"
             "• Đảm bảo liên kết chính xác và có thể truy cập công khai.\n"
             "• Video không bị khóa riêng tư hoặc giới hạn độ tuổi."

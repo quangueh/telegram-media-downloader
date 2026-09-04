@@ -16,8 +16,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Sao chép và cài đặt các phụ thuộc Python
+# BUILD_DATE làm mới layer này mỗi lần build để luôn cài yt-dlp mới nhất
+# (yt-dlp cũ là nguyên nhân hàng đầu khiến bot lỗi thời sau khi nền tảng đổi API)
+ARG BUILD_DATE
+LABEL build_date=$BUILD_DATE
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade -r requirements.txt \
+    && pip install --no-cache-dir --upgrade yt-dlp
 
 # Sao chép toàn bộ mã nguồn vào container
 COPY . .
