@@ -28,7 +28,7 @@ from downloader import (
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ADMIN — Theo dõi user nào gửi link nào
 # ═══════════════════════════════════════════════════════════════════════════════
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or "0")
 
 # Activity log: deque tự xóa cũ nhất, giữ tối đa 200 entries
 _activity_log: deque = deque(maxlen=200)
