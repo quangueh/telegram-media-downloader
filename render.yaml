@@ -18,6 +18,12 @@ services:
         value: "1"
       - key: REQUEST_TIMEOUT
         value: "180"
+      # YouTube cookies (optional): paste Netscape-format cookies.txt content
+      # to bypass "Sign in to confirm you're not a bot" on Render.
+      # Leave empty: bot uses tv/visionos/android_vr clients instead.
+      - key: YOUTUBE_COOKIES
+        value: ""
+        sync: false
 
   # Tùy chọn 2: Nếu bạn muốn chạy dưới dạng Background Worker (yêu cầu gói Starter trả phí của Render):
   # - type: worker

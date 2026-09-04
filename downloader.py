@@ -2,6 +2,7 @@ import os
 import re
 import uuid
 import asyncio
+import tempfile
 from pathlib import Path
 from typing import Tuple, Optional, Union
 
@@ -16,8 +17,19 @@ TIKTOK_URL_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/[^\s]+", re.IGNORECASE
 )
 
+# Pattern nhận diện liên kết YouTube
+YOUTUBE_URL_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[^\s]+",
+    re.IGNORECASE,
+)
+
 # API công cộng trả về stream TikTok không watermark (dự phòng khi yt-dlp bị TikTok chặn IP datacenter)
 TIKTOK_FALLBACK_API = "https://www.tikwm.com/api/"
+
+# Player client YouTube không yêu cầu PO Token — bypass "Sign in to confirm you're not a bot"
+# trên IP datacenter (Render, Railway, Koyeb,...)
+# tv: GVS_PO_TOKEN_POLICY=required=False; visionos: tương tự; android_vr: player_token_required=False
+YOUTUBE_PLAYER_CLIENTS = ["tv", "visionos", "android_vr"]
 
 
 class DownloaderError(Exception):
@@ -43,6 +55,11 @@ class VideoDownloadError(DownloaderError):
 def _is_tiktok_url(url: str) -> bool:
     """Kiểm tra liên kết có phải TikTok hay không (hỗ trợ cả liên kết rút gọn)."""
     return bool(TIKTOK_URL_PATTERN.search(url))
+
+
+def _is_youtube_url(url: str) -> bool:
+    """Kiểm tra liên kết có phải YouTube hay không (youtu.be / youtube.com/watch)."""
+    return bool(YOUTUBE_URL_PATTERN.search(url))
 
 
 async def _download_tiktok_fallback(
@@ -184,6 +201,36 @@ def _sync_extract_and_download(url: str, output_dir: Union[str, Path]) -> Tuple[
         # Tối ưu hóa cho TikTok không watermark: yt-dlp mặc định lấy direct stream HD không logo
         "postprocessor_hooks": [postprocessor_hook],
     }
+
+    # ── YouTube-specific: bypass "Sign in to confirm you're not a bot" trên IP datacenter ──
+    # Các player client tv/visionos/android_vr có GVS_PO_TOKEN_POLICY=required=False,
+    # không cần PO token nên bypass được bot-check trên Render/Railway/Koyeb.
+    if _is_youtube_url(url):
+        ydl_opts["extractor_args"] = {"youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS}}
+        # Để YouTube thích hợp hơn cho Telegram (49MB limit):
+        # Progressive mp4 thường nhỏ hơn DASH separate streams; ưu tiên progressive <45MB
+        # trước khi thử DASH (bao gồm fileSize_approx để yt-dlp tự reject sớm)
+        ydl_opts["format"] = (
+            "best[ext=mp4][filesize_approx<45M]/"
+            "bestvideo[ext=mp4][filesize_approx<45M]+bestaudio[ext=m4a]/"
+            "best[ext=mp4]/best"
+        )
+        logger.info(f"YouTube URL detected — using player clients: {YOUTUBE_PLAYER_CLIENTS}")
+
+    # ── Optional: Cookie-based auth khi cần (giải pháp "bom nguyên tử" — luôn đúng) ──
+    # Nhập YOUTUBE_COOKIES trong Render Dashboard theo định dạng Netscape cookie string
+    # Để biết cách lấy cookie: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies
+    cookies_str = os.getenv("YOUTUBE_COOKIES", "").strip()
+    if cookies_str:
+        # Hỗ trợ 2 cách: (1) nội dung cookies.txt multiline, (2) đường dẫn file cookies.txt
+        if os.path.isfile(cookies_str):
+            ydl_opts["cookiefile"] = cookies_str
+        else:
+            # Ghi nội dung cookie string vào file tạm
+            cookie_file = Path(tempfile.gettempdir()) / "yt_cookies.txt"
+            cookie_file.write_text(cookies_str, encoding="utf-8")
+            ydl_opts["cookiefile"] = str(cookie_file)
+        logger.info("YouTube cookies loaded from YOUTUBE_COOKIES env var.")
 
     logger.info(f"Bắt đầu phân tích và tải URL: {url}")
 
