@@ -1,0 +1,17 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: telegram-media-downloader
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Giữ thư mục downloads tạm thời trong container hoặc map ra ngoài nếu cần debug
+      - temp-downloads:/app/downloads
+
+volumes:
+  temp-downloads:

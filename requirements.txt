@@ -1,0 +1,4 @@
+python-telegram-bot[rate-limiter]>=20.7
+yt-dlp>=2024.08.06
+aiofiles>=23.2.1
+python-dotenv>=1.0.1

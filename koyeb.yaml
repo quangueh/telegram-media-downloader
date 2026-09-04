@@ -1,0 +1,19 @@
+# Cấu hình tự động triển khai trên Koyeb PaaS
+# Tham khảo: https://www.koyeb.com/docs/reference/koyeb-yaml
+name: telegram-media-downloader
+services:
+  - name: bot
+    type: worker
+    instance_type: nano
+    regions:
+      - fra
+    build:
+      docker:
+        dockerfile: Dockerfile
+    env:
+      - key: BOT_TOKEN
+        value: "{{ secret.TELEGRAM_BOT_TOKEN }}"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: PYTHONUNBUFFERED
+        value: "1"

@@ -1,0 +1,35 @@
+# Render Blueprint Specification
+# Tài liệu tham khảo: https://render.com/docs/blueprint-spec
+services:
+  # Gói Web Service (Có thể chọn gói Free Tier)
+  # Nhờ tích hợp HTTP Health-Check server trong bot.py, Render sẽ phát hiện cổng thành công
+  - type: web
+    name: telegram-media-downloader
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: singapore
+    envVars:
+      - key: BOT_TOKEN
+        sync: false # Giá trị bảo mật, Render sẽ yêu cầu bạn nhập trong Dashboard khi tạo service
+      - key: LOG_LEVEL
+        value: INFO
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: REQUEST_TIMEOUT
+        value: "180"
+
+  # Tùy chọn 2: Nếu bạn muốn chạy dưới dạng Background Worker (yêu cầu gói Starter trả phí của Render):
+  # - type: worker
+  #   name: telegram-media-downloader-worker
+  #   runtime: docker
+  #   dockerfilePath: ./Dockerfile
+  #   plan: starter
+  #   region: singapore
+  #   envVars:
+  #     - key: BOT_TOKEN
+  #       sync: false
+  #     - key: LOG_LEVEL
+  #       value: INFO
+  #     - key: PYTHONUNBUFFERED
+  #       value: "1"
