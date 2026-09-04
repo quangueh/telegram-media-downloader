@@ -9,15 +9,15 @@ ENV PYTHONUNBUFFERED=1 \
     BGUTIL_PORT=4416
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  STEP 1: System deps — FFmpeg + Node.js 20
+#  STEP 1: System deps — FFmpeg + Node.js 22 LTS
 # ═══════════════════════════════════════════════════════════════════════════════
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
     curl \
     git \
-    # Node.js 20 LTS — cần cho bgutil PO-token server
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    # Node.js 22 LTS — bgutil v1.3.2 yêu cầu >=22
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
