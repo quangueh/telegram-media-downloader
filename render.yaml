@@ -23,6 +23,9 @@ services:
       # Leave empty: bot uses visionos/android_vr/tv clients instead.
       - key: YOUTUBE_COOKIES
         value: ""
+      # Admin Telegram user ID — chỉ user này mới dùng được /admin
+      - key: ADMIN_USER_ID
+        value: ""
 
   # Tùy chọn 2: Nếu bạn muốn chạy dưới dạng Background Worker (yêu cầu gói Starter trả phí của Render):
   # - type: worker

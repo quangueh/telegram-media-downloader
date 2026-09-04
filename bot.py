@@ -3,6 +3,8 @@ import re
 import html
 import asyncio
 import threading
+import time
+from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from telegram import Update
@@ -22,6 +24,34 @@ from downloader import (
     VideoDownloadError,
     YOUTUBE_PLAYER_CLIENTS,
 )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ADMIN — Theo dõi user nào gửi link nào
+# ═══════════════════════════════════════════════════════════════════════════════
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+
+# Activity log: deque tự xóa cũ nhất, giữ tối đa 200 entries
+_activity_log: deque = deque(maxlen=200)
+
+
+def _log_activity(
+    user_id: int,
+    username: str,
+    first_name: str,
+    url: str,
+    platform: str,
+    status: str,
+) -> None:
+    """Ghi lại hoạt động gửi link của user."""
+    _activity_log.append({
+        "time": time.time(),
+        "user_id": user_id,
+        "username": username or "-",
+        "name": first_name or "-",
+        "url": url[:80],
+        "platform": platform,
+        "status": status,
+    })
 
 # Regex phát hiện URL trong tin nhắn văn bản
 URL_REGEX = re.compile(r"https?://[^\s]+", re.IGNORECASE)
@@ -56,6 +86,70 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
 
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Xem lịch sử gửi link của users (chỉ admin)."""
+    if not update.message:
+        return
+
+    user = update.effective_user
+    if ADMIN_USER_ID == 0 or user.id != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ Bạn không có quyền truy cập lệnh này.")
+        return
+
+    if not _activity_log:
+        await update.message.reply_text("📋 Chưa có hoạt động nào được ghi nhận.")
+        return
+
+    # Đếm user unique + tổng request
+    users = {}
+    for entry in _activity_log:
+        uid = entry["user_id"]
+        if uid not in users:
+            users[uid] = {"name": entry["name"], "username": entry["username"], "count": 0, "last": entry}
+        users[uid]["count"] += 1
+        users[uid]["last"] = entry
+
+    # Tổng quan
+    total = len(_activity_log)
+    success = sum(1 for e in _activity_log if e["status"] == "✅")
+    failed = total - success
+    lines = [
+        f"📊 <b>ADMIN DASHBOARD</b>",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"📥 Tổng requests: <b>{total}</b> | ✅ {success} | ❌ {failed}",
+        f"👤 Users: <b>{len(users)}</b>",
+        "",
+        f"👤 <b>DANH SÁCH USERS</b>",
+        f"━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    for uid, info in sorted(users.items(), key=lambda x: -x[1]["count"]):
+        uname = f"@{info['username']}" if info["username"] != "-" else f"ID: {uid}"
+        lines.append(f"• {info['name']} ({uname}) — <b>{info['count']}</b> link")
+
+    # 10 hoạt động gần nhất
+    lines.append("")
+    lines.append(f"📜 <b>10 HOẠT ĐỘNG GẦN NHẤT</b>")
+    lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+
+    for entry in list(_activity_log)[-10:][::-1]:
+        t = time.strftime("%d/%m %H:%M", time.localtime(entry["time"]))
+        uname = f"@{entry['username']}" if entry["username"] != "-" else f"ID:{entry['user_id']}"
+        url_short = entry["url"][:50] + ("..." if len(entry["url"]) > 50 else "")
+        lines.append(
+            f"{entry['status']} <code>{t}</code> {entry['name']} ({uname})\n"
+            f"  🌐 {entry['platform']} — <code>{html.escape(url_short)}</code>"
+        )
+
+    text = "\n".join(lines)
+
+    # Telegram limit 4096 chars
+    if len(text) > 4000:
+        text = text[:3990] + "\n..."
+
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
 async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Xử lý tin nhắn chứa liên kết video, thực hiện tải và gửi video về người dùng."""
     if not update.message or not update.message.text:
@@ -70,6 +164,17 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat_id = update.effective_chat.id
     status_msg = None
     downloaded_file = None
+
+    # Xác định nền tảng
+    user = update.effective_user
+    if "tiktok.com" in url.lower() or "vm.tiktok.com" in url.lower():
+        platform = "TikTok"
+    elif "youtube.com" in url.lower() or "youtu.be" in url.lower():
+        platform = "YouTube"
+    elif "facebook.com" in url.lower() or "fb.watch" in url.lower():
+        platform = "Facebook"
+    else:
+        platform = "Other"
 
     try:
         # Gửi tin nhắn phản hồi ban đầu
@@ -121,8 +226,22 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             except Exception:
                 pass
 
+        # Ghi log thành công
+        _log_activity(
+            user_id=user.id if user else 0,
+            username=user.username if user else "",
+            first_name=user.first_name if user else "",
+            url=url, platform=platform, status="✅",
+        )
+
     except VideoTooLargeError as e:
         logger.warning(f"File quá lớn khi tải {url}: {e}")
+        _log_activity(
+            user_id=user.id if user else 0,
+            username=user.username if user else "",
+            first_name=user.first_name if user else "",
+            url=url, platform=platform, status="⚠️ Quá lớn",
+        )
         error_text = (
             f"⚠️ <b>Không thể gửi video:</b>\n{str(e)}\n\n"
             "💡 <i>Gợi ý: Do giới hạn Telegram Bot API là 50MB, bạn hãy thử tải các video ngắn hơn hoặc độ phân giải thấp hơn.</i>"
@@ -134,6 +253,12 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     except VideoDownloadError as e:
         logger.error(f"Lỗi tải video {url}: {e}")
+        _log_activity(
+            user_id=user.id if user else 0,
+            username=user.username if user else "",
+            first_name=user.first_name if user else "",
+            url=url, platform=platform, status="❌ Lỗi",
+        )
         # Hiển thị phần lỗi gốc để người dùng và dev biết nguyên nhân thật (IP bị chặn, extractor lỗi...)
         reason = str(e).replace("Lỗi tải video từ nền tảng: ", "").strip()
         if len(reason) > 300:
@@ -257,6 +382,7 @@ def main() -> None:
     # Đăng ký Command Handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("admin", admin_command))
 
     # Đăng ký Message Handler bắt link HTTP/HTTPS
     application.add_handler(
