@@ -1,34 +1,64 @@
 FROM python:3.11-slim
 
-# Thiết lập biến môi trường
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ENV
+# ═══════════════════════════════════════════════════════════════════════════════
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    DOWNLOAD_DIR=/app/downloads
+    DOWNLOAD_DIR=/app/downloads \
+    BGUTIL_PORT=4416
 
-# Cài đặt FFmpeg và các công cụ hỗ trợ cần thiết
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 1: System deps — FFmpeg + Node.js 20
+# ═══════════════════════════════════════════════════════════════════════════════
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     ca-certificates \
     curl \
+    git \
+    # Node.js 20 LTS — cần cho bgutil PO-token server
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Thiết lập thư mục làm việc
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 2: bgutil-ytdlp-pot-provider (clone + build)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Source: https://github.com/Brainicism/bgutil-ytdlp-pot-provider
+# Server listens on http://127.0.0.1:4416 — yt-dlp plugin auto-detects it
+RUN git clone --single-branch --branch 1.3.2 \
+        https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
+        /opt/bgutil \
+    && cd /opt/bgutil/server \
+    && npm ci \
+    && npx tsc
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 3: Python deps
+# ═══════════════════════════════════════════════════════════════════════════════
 WORKDIR /app
 
-# Sao chép và cài đặt các phụ thuộc Python
-# BUILD_DATE làm mới layer này mỗi lần build để luôn cài yt-dlp mới nhất
-# (yt-dlp cũ là nguyên nhân hàng đầu khiến bot lỗi thời sau khi nền tảng đổi API)
+# BUILD_DATE tạo layer mới mỗi lần build — đảm bảo yt-dlp + bgutil plugin luôn mới nhất
 ARG BUILD_DATE
 LABEL build_date=$BUILD_DATE
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade -r requirements.txt \
-    && pip install --no-cache-dir --upgrade yt-dlp
 
-# Sao chép toàn bộ mã nguồn vào container
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir --upgrade -r requirements.txt \
+    && pip install --no-cache-dir --upgrade yt-dlp \
+    && pip install --no-cache-dir --upgrade bgutil-ytdlp-pot-provider
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STEP 4: Copy source
+# ═══════════════════════════════════════════════════════════════════════════════
 COPY . .
 
-# Tạo thư mục downloads để lưu trữ file tạm thời
 RUN mkdir -p /app/downloads
 
-# Lệnh khởi chạy ứng dụng unbuffered
-CMD ["python", "-u", "bot.py"]
+# Đảm bảo start.sh executable
+RUN chmod +x start.sh
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CMD: Khởi chạy bgutil server (background) → python bot
+# ═══════════════════════════════════════════════════════════════════════════════
+CMD ["./start.sh"]

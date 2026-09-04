@@ -20,6 +20,7 @@ from downloader import (
     extract_and_download,
     VideoTooLargeError,
     VideoDownloadError,
+    YOUTUBE_PLAYER_CLIENTS,
 )
 
 # Regex phát hiện URL trong tin nhắn văn bản
@@ -175,6 +176,29 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     logger.error("Ngoại lệ phát sinh khi xử lý update:", exc_info=context.error)
 
 
+def log_build_info() -> None:
+    """Ghi thông tin phiên bản khi khởi động để đối chiếu với logs trên Render."""
+    import subprocess
+    import yt_dlp
+
+    try:
+        commit = (
+            subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip() or "unknown"
+        )
+    except Exception:
+        commit = "unknown (no git in container)"
+
+    cookies_configured = bool(os.getenv("YOUTUBE_COOKIES", "").strip())
+    logger.info(
+        f"BUILD INFO — commit: {commit} | yt-dlp: {yt_dlp.version.__version__} | "
+        f"YT player clients: {YOUTUBE_PLAYER_CLIENTS} | "
+        f"YouTube cookies: {'CẤU HÌNH' if cookies_configured else 'chưa có'}"
+    )
+
+
 class HealthCheckHandler(BaseHTTPRequestHandler):
     """Handler phục vụ health check HTTP của Render để giữ bot hoạt động."""
     def do_GET(self) -> None:
@@ -217,6 +241,7 @@ def main() -> None:
         return
 
     logger.info("Đang khởi động Telegram Media Downloader Bot...")
+    log_build_info()
 
     # Khởi chạy máy chủ HTTP Health Check nếu phát hiện biến PORT (Render Web Service)
     if PORT > 0:
