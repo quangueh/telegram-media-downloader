@@ -20,8 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Node.js 22 LTS — cài trực tiếp binary (không cần nodesource repo)
 RUN ARCH=$(dpkg --print-architecture) && \
     if [ "$ARCH" = "arm64" ]; then NODE_ARCH="arm64"; else NODE_ARCH="x64"; fi && \
-    curl -fsSL "https://nodejs.org/dist/v22.18.0/node-v22.18.0-linux-${NODE_ARCH}.tar.xz" \
-    | tar -xJ -C /usr/local --strip-components=1
+    curl -fsSL "https://nodejs.org/dist/v22.18.0/node-v22.18.0-linux-${NODE_ARCH}.tar.gz" \
+    | tar -xzf - -C /usr/local --strip-components=1
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  STEP 2: bgutil server (clone + build)
