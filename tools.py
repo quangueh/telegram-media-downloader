@@ -357,14 +357,13 @@ def get_youtube_thumbnail(video_id: str, output_path: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TOOL 9: DICE ROLL
 # ═══════════════════════════════════════════════════════════════════════════════
-def roll_dice(expression: str = "1d6") -> str:
+def parse_dice(expression: str = "1d6") -> tuple[int, int]:
     """
-    Roll dice theo cú pháp NdM (VD: 2d6, 1d20, 3d4).
-    Trả về chuỗi kết quả đã format.
+    Parse cú pháp NdM (VD: 2d6, 1d20, 3d4, hoặc số trần "6" → 1d6).
+    Trả về (count, sides) sau khi clamp giới hạn chống spam.
     """
     expr = expression.strip().lower().replace(" ", "")
 
-    # Parse NdM hoặc N hoặc M (mặc định 1d6)
     match = re.match(r"^(\d*)d(\d+)$", expr)
     if match:
         count = int(match.group(1) or 1)
@@ -374,9 +373,17 @@ def roll_dice(expression: str = "1d6") -> str:
     else:
         count, sides = 1, 6
 
-    # Giới hạn chống spam
     count = max(1, min(count, 20))
     sides = max(2, min(sides, 1000))
+    return count, sides
+
+
+def roll_dice(expression: str = "1d6") -> str:
+    """
+    Roll dice theo cú pháp NdM (VD: 2d6, 1d20, 3d4).
+    Trả về chuỗi kết quả đã format.
+    """
+    count, sides = parse_dice(expression)
 
     rolls = [random.randint(1, sides) for _ in range(count)]
     total = sum(rolls)

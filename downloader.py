@@ -177,6 +177,18 @@ def _fmt_mb(num_bytes: float) -> str:
     return f"{num_bytes / (1024 * 1024):.1f}MB"
 
 
+# Strip ANSI escape codes (yt-dlp error dính màu terminal: [0;31mERROR[0m)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _clean_error(e: BaseException) -> str:
+    """Làm sạch thông điệp lỗi: bỏ ANSI codes, giới hạn độ dài."""
+    msg = _ANSI_RE.sub("", str(e)).strip()
+    if len(msg) > 280:
+        msg = msg[:280] + "..."
+    return msg
+
+
 def _build_ytdlp_opts(
     url: str,
     target_dir: Path,
@@ -586,12 +598,12 @@ async def extract_and_download(
             if result:
                 return result
         except (VideoTooLargeError, VideoDownloadError) as e:
-            errors.append(f"yt-dlp: {e}")
+            errors.append(f"yt-dlp: {_clean_error(e)}")
             if isinstance(e, VideoTooLargeError):
                 raise  # Video quá lớn không phụ thuộc backend
             logger.warning(f"yt-dlp YouTube fail, thử Piped API: {e}")
         except Exception as e:
-            errors.append(f"yt-dlp: {e}")
+            errors.append(f"yt-dlp: {_clean_error(e)}")
             logger.warning(f"yt-dlp YouTube fail, thử Piped API: {e}")
 
         # Backend 2: Piped API
@@ -603,7 +615,7 @@ async def extract_and_download(
         except VideoTooLargeError:
             raise
         except Exception as e:
-            errors.append(f"Piped: {e}")
+            errors.append(f"Piped: {_clean_error(e)}")
             logger.warning(f"Piped API fail: {e}")
 
         raise VideoDownloadError(
@@ -613,6 +625,7 @@ async def extract_and_download(
 
     # ── TikTok routing ──
     if _is_tiktok_url(url):
+        errors = []
         try:
             result = await loop.run_in_executor(
                 None, _sync_ytdlp_download, url, target_dir, _cb
@@ -620,18 +633,29 @@ async def extract_and_download(
             if result:
                 return result
         except (VideoTooLargeError, VideoDownloadError) as e:
+            errors.append(f"yt-dlp: {_clean_error(e)}")
             if isinstance(e, VideoTooLargeError):
-                raise
+                raise  # Video quá lớn không phụ thuộc backend
             logger.warning(f"yt-dlp TikTok fail, thử tikwm API: {e}")
         except Exception as e:
+            errors.append(f"yt-dlp: {_clean_error(e)}")
             logger.warning(f"yt-dlp TikTok fail, thử tikwm API: {e}")
 
         # Fallback: tikwm API
-        result = await _download_via_tikwm(url, target_dir, _cb)
-        if result:
-            return result
+        try:
+            result = await _download_via_tikwm(url, target_dir, _cb)
+            if result:
+                return result
+            errors.append("tikwm: không lấy được link video (API trả về trống)")
+        except VideoTooLargeError:
+            raise
+        except Exception as e:
+            errors.append(f"tikwm: {_clean_error(e)}")
 
-        raise VideoDownloadError("Không thể tải video TikTok từ bất kỳ backend nào.")
+        raise VideoDownloadError(
+            "TikTok: tất cả backend đều thất bại.\n"
+            + "\n".join(f"• {err}" for err in errors)
+        )
 
     # ── Facebook / nền tảng khác: yt-dlp mặc định ──
     result = await loop.run_in_executor(

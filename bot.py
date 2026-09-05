@@ -36,7 +36,7 @@ from tools import (
     extract_colors,
     add_watermark,
     get_youtube_thumbnail,
-    roll_dice,
+    parse_dice,
     image_to_ascii,
     extract_youtube_id,
 )
@@ -506,12 +506,47 @@ async def thumb_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """TOOL 9: /roll [NdM] — random dice."""
+    """TOOL 9: /roll [NdM] — xúc xắc animation native Telegram + kết quả."""
     if not update.message:
         return
+    chat_id = update.effective_chat.id
     expression = " ".join(context.args) if context.args else "1d6"
-    result = roll_dice(expression)
-    await update.message.reply_text(result, parse_mode=ParseMode.HTML)
+    count, sides = parse_dice(expression)
+
+    # Animation dice chỉ có mặt 6 (🎲) — chỉ animate khi đúng d6, tối đa 4 con
+    rolls: list[int] = []
+    animated = 0
+    if sides == 6:
+        for i in range(min(count, 4)):
+            try:
+                msg = await context.bot.send_dice(chat_id=chat_id, emoji="🎲")
+                # Telegram trả giá trị NGAY trong response — animation client
+                # chỉ là hiệu ứng, số cuối cùng của animation chính là value này
+                value = msg.dice.value if msg.dice else random.randint(1, 6)
+                rolls.append(value)
+                animated += 1
+                if i < min(count, 4) - 1:
+                    await asyncio.sleep(0.8)  # cách nhau cho animation dễ theo dõi
+            except Exception:
+                break
+        if animated:
+            # Đợi animation cuối chạy xong (~4s) rồi mới hiện kết quả
+            await asyncio.sleep(4.0)
+
+    # Roll phần còn lại (count > 4 hoặc dice != d6 → toàn bộ random)
+    rolls += [random.randint(1, sides) for _ in range(count - animated)]
+
+    total = sum(rolls)
+    roll_str = " + ".join(str(r) for r in rolls)
+    if count == 1:
+        summary = f"🎲 <b>{total}</b>"
+    else:
+        summary = f"🎲 {roll_str} = <b>{total}</b>"
+
+    try:
+        await update.message.reply_text(summary, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
 
 
 async def ascii_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -637,11 +672,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         elif mode == "ascii":
             ascii_text = await asyncio.to_thread(image_to_ascii, input_path, 60)
-            # Gửi trong code block
-            safe_ascii = ascii_text.replace("`", "'")
-            message = f"```\n{safe_ascii}\n```"
-            if len(message) > 4000:
-                message = message[:3990] + "\n```"
+            # Gửi trong <pre> — progress.finish giờ dùng HTML parse mode
+            if len(ascii_text) > 3950:
+                ascii_text = ascii_text[:3950]
+            message = f"<pre>{html.escape(ascii_text)}</pre>"
             await progress.finish(message)
             result_in_progress = True
 
@@ -773,7 +807,7 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"⚠️ <b>Không thể gửi video:</b>\n{str(e)}\n\n"
             "💡 <i>Gợi ý: Do giới hạn Telegram Bot API là 50MB, bạn hãy thử tải các video ngắn hơn hoặc độ phân giải thấp hơn.</i>"
         )
-        if progress._message:
+        if progress and progress._message:
             await progress.fail(error_text)
         else:
             await update.message.reply_text(error_text, parse_mode=ParseMode.HTML)
@@ -797,7 +831,7 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "• Đảm bảo liên kết chính xác và có thể truy cập công khai.\n"
             "• Video không bị khóa riêng tư hoặc giới hạn độ tuổi."
         )
-        if progress._message:
+        if progress and progress._message:
             await progress.fail(error_text)
         else:
             await update.message.reply_text(error_text, parse_mode=ParseMode.HTML)

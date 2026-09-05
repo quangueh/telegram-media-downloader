@@ -5,7 +5,7 @@ Telegram giới hạn edit tin nhắn (rate limit), không thể update mỗi ch
 → TelegramProgress throttle: gửi edit tối thiểu cách nhau MIN_EDIT_INTERVAL.
 
 Cách dùng:
-    reporter = TelegramProgress(bot, chat_id, "⏳ Đang tải video...")
+    reporter = TelegramProgress(context, chat_id, "⏳ Đang tải video...")
     await reporter.update(45.2, "Tải 12.3/45.0MB — 2.1MB/s")
     ...
     await reporter.finish("✅ Xong!")   # hoặc .fail("❌ Lỗi")
@@ -16,6 +16,7 @@ Callback on_progress cho downloader:
 """
 
 import asyncio
+import html
 import time
 from typing import Optional
 
@@ -66,7 +67,7 @@ class TelegramProgress:
         if self._finished or self._message is None:
             return
         now = time.monotonic()
-        # Điều kiện throttle: đủ interval HOẶC pct tăng đáng kể nhưng vẫn ≥1s
+        # Điều kiện throttle: đủ interval, % tăng đủ lớn
         if now - self._last_edit < MIN_EDIT_INTERVAL:
             return
         if pct is not None:
@@ -77,24 +78,24 @@ class TelegramProgress:
 
         bar = _render_bar(pct) if pct is not None else ""
         content = text or ""
-        msg = f"{self.title}\n{bar}\n{content}".strip()
+        msg = f"{html.escape(self.title)}\n{bar}\n{html.escape(content)}".strip()
         try:
-            await self._message.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
+            await self._message.edit_text(msg, parse_mode=ParseMode.HTML)
         except Exception:
             pass
 
     async def finish(self, text: str) -> None:
-        """Edit lần cuối — xóa thanh progress, chỉ để kết quả."""
+        """Edit lần cuối — xóa thanh progress, chỉ để kết quả (HTML text)."""
         if self._finished or self._message is None:
             return
         self._finished = True
         try:
-            await self._message.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+            await self._message.edit_text(text, parse_mode=ParseMode.HTML)
         except Exception:
             pass
 
     async def fail(self, text: str) -> None:
-        """Giống finish nhưng giữ chế độ HTML parse (lỗi thường chứa <b>)."""
+        """Edit lần cuối khi lỗi (HTML text)."""
         if self._finished or self._message is None:
             return
         self._finished = True
