@@ -412,7 +412,7 @@ def _build_ytdlp_opts(
         "retries": 1,
         "fragment_retries": 1,
         "extractor_retries": 1,
-        "socket_timeout": 15,
+        "socket_timeout": 10,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -880,7 +880,7 @@ async def _run_executor(
     timeout: int = YTDLP_TIMEOUT,
     start_text: str = "⏳ Đang xử lý...",
     heartbeat_text: str = "⏳ Vẫn đang xử lý, xin chờ...",
-    heartbeat_interval: float = 15.0,
+    heartbeat_interval: float = 10.0,
 ):
     """Chạy func trong executor với heartbeat progress + timeout (tránh 'cứng đơ')."""
     if progress_cb:
@@ -952,7 +952,10 @@ async def extract_and_download(
             result = await _run_executor(
                 loop, _sync_ytdlp_download, (url, target_dir, _cb),
                 progress_cb=_cb,
-                start_text="⏳ Đang lấy thông tin video (yt-dlp)...",
+                start_text=(
+                    "⏳ Đang lấy thông tin video YouTube...\n"
+                    "(Nếu máy chủ bị YouTube chặn, có thể mất 1-2 phút)"
+                ),
                 heartbeat_text="⏳ Vẫn đang xử lý YouTube, xin chờ...",
             )
             if result:
