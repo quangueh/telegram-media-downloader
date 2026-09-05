@@ -165,11 +165,24 @@ def _is_mp4_container(container: str) -> bool:
     return any(t in _MP4_CONTAINERS for t in tokens)
 
 
-def _ensure_playable(file_path: str) -> str:
+def _probe_duration(file_path: str) -> float:
+    """Trả về thời lượng video (giây), 0 nếu không xác định."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", file_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float(result.stdout.strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def _ensure_playable(file_path: str, progress_cb: ProgressCB = None) -> str:
     """
     Đảm bảo file là H.264 + AAC trong MP4 (moov atom ở đầu) — phát được trên mọi
     điện thoại / PC / Telegram. Nếu codec không tương thích (VP9/AV1/HEVC...) thì
-    re-encode bằng FFmpeg sang H.264. Trả về đường dẫn file cuối.
+    re-encode bằng FFmpeg sang H.264 (có báo tiến trình). Trả về đường dẫn file cuối.
     """
     vcodec = _probe_stream_codec(file_path, "v:0")
     acodec = _probe_stream_codec(file_path, "a:0")
@@ -186,6 +199,7 @@ def _ensure_playable(file_path: str) -> str:
         f"File không tương thích (vcodec={vcodec or '-'}, acodec={acodec or '-'}, "
         f"container={container or '-'}) — đang chuyển sang H.264 + AAC..."
     )
+    duration = _probe_duration(file_path)
     tmp_path = file_path + ".playable.mp4"
     cmd = ["ffmpeg", "-y", "-i", file_path]
     if vcodec in ("h264", "avc1"):
@@ -194,18 +208,55 @@ def _ensure_playable(file_path: str) -> str:
         cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
     if acodec and acodec not in ("aac", "mp3"):
         cmd += ["-c:a", "aac", "-b:a", "128k"]
-    cmd += ["-movflags", "+faststart", "-f", "mp4", "-loglevel", "error", tmp_path]
+    cmd += ["-movflags", "+faststart", "-f", "mp4",
+            "-progress", "pipe:1", "-nostats", "-loglevel", "error", tmp_path]
+
+    def report(pct, text):
+        if progress_cb:
+            try:
+                progress_cb(pct, text)
+            except Exception:
+                pass
+
+    report(None, "🔧 Đang chuyển codec sang H.264 + AAC (phát được mọi thiết bị)...")
+    last_report = 0.0
+    proc = None
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=900)
-        if result.returncode == 0 and os.path.exists(tmp_path):
-            os.replace(tmp_path, file_path)
-            return file_path
-        logger.warning(
-            f"Re-encode thất bại: {result.stderr.decode('utf-8', errors='replace')[-300:]}"
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
         )
+        for line in proc.stdout:
+            if line.startswith("out_time_us="):
+                try:
+                    out_us = int(line.split("=", 1)[1])
+                    if duration > 0 and out_us > 0:
+                        pct = min(99.0, out_us / (duration * 1_000_000) * 100)
+                        now = time.monotonic()
+                        if now - last_report >= 1.0:
+                            last_report = now
+                            report(pct, f"🔧 Đang chuyển codec... {pct:.0f}%")
+                except ValueError:
+                    pass
+        proc.wait(timeout=900)
+        if proc.returncode == 0 and os.path.exists(tmp_path):
+            os.replace(tmp_path, file_path)
+            report(100, "✅ Chuyển codec xong (H.264 + AAC)")
+            return file_path
+        stderr = proc.stderr.read()[-300:] if proc.stderr else "unknown"
+        logger.warning(f"Re-encode thất bại: {stderr}")
     except Exception as e:
         logger.warning(f"Re-encode lỗi: {e}")
     finally:
+        if proc:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            try:
+                proc.stderr.close()
+            except Exception:
+                pass
         if os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -218,19 +269,45 @@ def _ensure_playable(file_path: str) -> str:
 #  SHARED: HTTP STREAM DOWNLOAD
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Headers giả trình duyệt — nhiều CDN (TikTok...) chặn/throttle request không có UA hợp lệ
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.tiktok.com/",
+    "Accept": "video/webm,video/mp4,video/*,*/*;q=0.8",
+}
+
+
+class IncompleteDownloadError(DownloaderError):
+    """File tải về bị cắt ngắn (ít hơn content-length) — file hỏng, cần tải lại."""
+
+
 async def _http_download_stream(
     url: str,
     dest: Path,
-    timeout: int = 120,
+    timeout: int = 60,
     progress_cb: ProgressCB = None,
     label: str = "⬇️ Đang tải",
+    headers: Optional[dict] = None,
+    progress_interval: float = 1.0,
 ) -> int:
-    """Tải file mp4 từ URL bằng httpx streaming. Trả về kích thước bytes. Ném VideoTooLargeError nếu vượt giới hạn."""
+    """Tải file mp4 từ URL bằng httpx streaming.
+
+    - Dùng headers trình duyệt mặc định (TikTok CDN throttle UA lạ).
+    - Báo tiến trình mỗi progress_interval giây.
+    - Ném VideoTooLargeError nếu vượt giới hạn; IncompleteDownloadError nếu tải bị
+      cắt ngắn so với content-length (file hỏng). Trả về kích thước bytes.
+    """
     downloaded = 0
     last_report = 0.0
+    total = 0
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(timeout, connect=15),
         follow_redirects=True,
+        headers=headers or _BROWSER_HEADERS,
     ) as client:
         async with client.stream("GET", url) as resp:
             resp.raise_for_status()
@@ -241,10 +318,9 @@ async def _http_download_stream(
                     if downloaded > MAX_FILE_SIZE:
                         raise VideoTooLargeError(downloaded, MAX_FILE_SIZE)
                     f.write(chunk)
-                    # Report mỗi 2s để throttle từ phía stream luôn
                     if progress_cb:
                         now = time.monotonic()
-                        if now - last_report >= 2.0:
+                        if now - last_report >= progress_interval:
                             last_report = now
                             if total > 0:
                                 pct = downloaded / total * 100
@@ -256,6 +332,12 @@ async def _http_download_stream(
                                 progress_cb(pct, text)
                             except Exception:
                                 pass
+
+    # Kiểm tra file đã tải đủ chưa — cắt ngắn = file hỏng, không gửi cho user
+    if total > 0 and downloaded < total:
+        raise IncompleteDownloadError(
+            f"Tải xuống bị cắt ngắn: {downloaded}/{total} bytes"
+        )
     return downloaded
 
 
@@ -305,6 +387,11 @@ def _build_ytdlp_opts(
         "no_warnings": True,
         "noplaylist": True,
         "postprocessor_args": ["-movflags", "+faststart"],
+        # Fast-fail: tránh yt-dlp retry mặc định 10 lần → treo hàng phút khi bị chặn
+        "retries": 1,
+        "fragment_retries": 1,
+        "extractor_retries": 1,
+        "socket_timeout": 15,
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -390,58 +477,63 @@ def _sync_ytdlp_download(
 
     logger.info(f"yt-dlp đang xử lý: {url}")
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info_dict = ydl.extract_info(url, download=False)
-        if not info_dict:
-            raise VideoDownloadError("Không thể lấy thông tin từ URL được cung cấp.")
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info_dict = ydl.extract_info(url, download=False)
+            if not info_dict:
+                raise VideoDownloadError("Không thể lấy thông tin từ URL được cung cấp.")
 
-        # Kiểm tra kích thước ước lượng nếu có sẵn
-        estimated_size = info_dict.get("filesize") or info_dict.get("filesize_approx")
-        if estimated_size and estimated_size > MAX_FILE_SIZE:
-            raise VideoTooLargeError(estimated_size, MAX_FILE_SIZE)
+            # Kiểm tra kích thước ước lượng nếu có sẵn
+            estimated_size = info_dict.get("filesize") or info_dict.get("filesize_approx")
+            if estimated_size and estimated_size > MAX_FILE_SIZE:
+                raise VideoTooLargeError(estimated_size, MAX_FILE_SIZE)
 
-        title = info_dict.get("title", "Video")
-        duration = int(info_dict.get("duration") or 0)
+            title = info_dict.get("title", "Video")
+            duration = int(info_dict.get("duration") or 0)
 
-        download_info = ydl.extract_info(url, download=True)
+            download_info = ydl.extract_info(url, download=True)
 
-        final_file = downloaded_filepath or ydl.prepare_filename(download_info)
-        if not os.path.exists(final_file):
-            base = os.path.splitext(final_file)[0]
-            for ext in [".mp4", ".mkv", ".webm"]:
-                if os.path.exists(base + ext):
-                    final_file = base + ext
-                    break
-            else:
-                candidates = [
-                    f for f in target_dir.glob(f"*{unique_id}*")
-                    if not f.name.endswith((".part", ".ytdl", ".temp"))
-                ]
-                if candidates:
-                    final_file = str(candidates[0])
+            final_file = downloaded_filepath or ydl.prepare_filename(download_info)
+            if not os.path.exists(final_file):
+                base = os.path.splitext(final_file)[0]
+                for ext in [".mp4", ".mkv", ".webm"]:
+                    if os.path.exists(base + ext):
+                        final_file = base + ext
+                        break
                 else:
-                    raise VideoDownloadError("Không tìm thấy tệp video sau khi tải xuống.")
+                    candidates = [
+                        f for f in target_dir.glob(f"*{unique_id}*")
+                        if not f.name.endswith((".part", ".ytdl", ".temp"))
+                    ]
+                    if candidates:
+                        final_file = str(candidates[0])
+                    else:
+                        raise VideoDownloadError("Không tìm thấy tệp video sau khi tải xuống.")
 
-        actual_size = os.path.getsize(final_file)
-        if actual_size > MAX_FILE_SIZE:
-            try:
-                os.remove(final_file)
-            except OSError:
-                pass
-            raise VideoTooLargeError(actual_size, MAX_FILE_SIZE)
+            actual_size = os.path.getsize(final_file)
+            if actual_size > MAX_FILE_SIZE:
+                try:
+                    os.remove(final_file)
+                except OSError:
+                    pass
+                raise VideoTooLargeError(actual_size, MAX_FILE_SIZE)
 
-        # Đảm bảo codec H.264 + AAC trong mp4 — tránh màn trắng / unsupported
-        final_file = _ensure_playable(final_file)
-        actual_size = os.path.getsize(final_file)
-        if actual_size > MAX_FILE_SIZE:
-            try:
-                os.remove(final_file)
-            except OSError:
-                pass
-            raise VideoTooLargeError(actual_size, MAX_FILE_SIZE)
+            # Đảm bảo codec H.264 + AAC trong mp4 — tránh màn trắng / unsupported
+            final_file = _ensure_playable(final_file, progress_cb=progress_cb)
+            actual_size = os.path.getsize(final_file)
+            if actual_size > MAX_FILE_SIZE:
+                try:
+                    os.remove(final_file)
+                except OSError:
+                    pass
+                raise VideoTooLargeError(actual_size, MAX_FILE_SIZE)
 
-        logger.info(f"yt-dlp tải thành công: {final_file} ({actual_size / (1024*1024):.1f}MB)")
-        return final_file, title, duration
+            logger.info(f"yt-dlp tải thành công: {final_file} ({actual_size / (1024*1024):.1f}MB)")
+            return final_file, title, duration
+    except yt_dlp.utils.DownloadError as e:
+        # Wrap mọi lỗi yt-dlp (DownloadError) thành VideoDownloadError
+        # để router/bot xử lý thống nhất, không lọt ra ngoài
+        raise VideoDownloadError(_clean_error(e)) from e
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -582,7 +674,7 @@ async def _download_via_piped(
 
         # Kiểm tra kích thước cuối
         if os.path.exists(final_path):
-            final_path = _ensure_playable(final_path)
+            final_path = _ensure_playable(final_path, progress_cb=progress_cb)
             actual_size = os.path.getsize(final_path)
             if actual_size > MAX_FILE_SIZE:
                 try:
@@ -597,8 +689,44 @@ async def _download_via_piped(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  BACKEND 3: TikTok tikwm API (fallback, đã hoạt động 2026-09-04)
+#  BACKEND 3: TikTok tikwm API (ưu tiên cho TikTok — nhanh, không watermark, ổn định hơn yt-dlp trên datacenter IP)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+async def _download_stream_with_retry(
+    url: str,
+    dest: Path,
+    label: str,
+    progress_cb: ProgressCB = None,
+    attempts: int = 3,
+) -> int:
+    """Tải stream với retry — CDN TikTok hay flaky/cắt ngắn, request mới thường thành công."""
+    last_err: Optional[BaseException] = None
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            if progress_cb:
+                try:
+                    progress_cb(None, f"⚠️ {label}: kết nối chậm, thử lại lần {attempt}/{attempts}...")
+                except Exception:
+                    pass
+            await asyncio.sleep(1.0)
+        try:
+            return await _http_download_stream(
+                url, dest, timeout=40, progress_cb=progress_cb, label=label,
+            )
+        except VideoTooLargeError:
+            raise
+        except Exception as e:
+            last_err = e
+            logger.warning(f"{label} lần {attempt}/{attempts} fail: {_clean_error(e)}")
+            if dest.exists():
+                try:
+                    dest.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    if last_err:
+        raise last_err
+    return 0
+
 
 async def _download_via_tikwm(
     url: str,
@@ -613,14 +741,16 @@ async def _download_via_tikwm(
     tiktok_url = match.group(0)
     if "vm.tiktok.com" in tiktok_url or "vt.tiktok.com" in tiktok_url:
         try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=15, headers=_BROWSER_HEADERS,
+            ) as client:
                 resp = await client.get(tiktok_url)
                 tiktok_url = str(resp.url)
         except Exception as e:
             logger.warning(f"Không thể mở rộng liên kết rút gọn TikTok: {e}")
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=60, headers=_BROWSER_HEADERS) as client:
             resp = await client.post(TIKTOK_FALLBACK_API, data={"url": tiktok_url, "hd": "1"})
             resp.raise_for_status()
             data = resp.json()
@@ -633,7 +763,9 @@ async def _download_via_tikwm(
         return None
 
     info = data["data"]
-    video_url = info.get("hdplay") or info.get("play")
+    # Ưu tiên stream `play` (H.264, phát được mọi thiết bị) — `hdplay` thường là
+    # HEVC, phải re-encode chậm. Chỉ dùng hdplay nếu không có play.
+    video_url = info.get("play") or info.get("hdplay")
     if not video_url:
         return None
 
@@ -651,9 +783,8 @@ async def _download_via_tikwm(
     file_path = target_dir / f"{safe_title}_{unique_id}.mp4"
 
     try:
-        await _http_download_stream(
-            video_url, file_path, progress_cb=progress_cb,
-            label="⬇️ Tải TikTok (tikwm)",
+        await _download_stream_with_retry(
+            video_url, file_path, label="⬇️ Tải TikTok (tikwm)", progress_cb=progress_cb,
         )
     except VideoTooLargeError:
         _cleanup_leftovers(target_dir, unique_id)
@@ -664,7 +795,7 @@ async def _download_via_tikwm(
         return None
 
     logger.info(f"TikTok tikwm tải thành công: {file_path}")
-    file_path = _ensure_playable(str(file_path))
+    file_path = _ensure_playable(str(file_path), progress_cb=progress_cb)
     return str(file_path), title, duration
 
 
@@ -739,6 +870,21 @@ async def extract_and_download(
     # ── TikTok routing ──
     if _is_tiktok_url(url):
         errors = []
+
+        # Backend 1: tikwm API — nhanh, không watermark, ổn định hơn yt-dlp
+        # (yt-dlp hay fail/treo trên TikTok với datacenter IP). yt-dlp chỉ là fallback.
+        try:
+            result = await _download_via_tikwm(url, target_dir, _cb)
+            if result:
+                return result
+            errors.append("tikwm: không lấy được link video (API trả về trống)")
+        except VideoTooLargeError:
+            raise
+        except Exception as e:
+            errors.append(f"tikwm: {_clean_error(e)}")
+            logger.warning(f"tikwm TikTok fail, thử yt-dlp: {e}")
+
+        # Backend 2: yt-dlp (fast-fail — retries=1, socket_timeout=15)
         try:
             result = await loop.run_in_executor(
                 None, _sync_ytdlp_download, url, target_dir, _cb
@@ -749,21 +895,10 @@ async def extract_and_download(
             errors.append(f"yt-dlp: {_clean_error(e)}")
             if isinstance(e, VideoTooLargeError):
                 raise  # Video quá lớn không phụ thuộc backend
-            logger.warning(f"yt-dlp TikTok fail, thử tikwm API: {e}")
+            logger.warning(f"yt-dlp TikTok fail: {e}")
         except Exception as e:
             errors.append(f"yt-dlp: {_clean_error(e)}")
-            logger.warning(f"yt-dlp TikTok fail, thử tikwm API: {e}")
-
-        # Fallback: tikwm API
-        try:
-            result = await _download_via_tikwm(url, target_dir, _cb)
-            if result:
-                return result
-            errors.append("tikwm: không lấy được link video (API trả về trống)")
-        except VideoTooLargeError:
-            raise
-        except Exception as e:
-            errors.append(f"tikwm: {_clean_error(e)}")
+            logger.warning(f"yt-dlp TikTok fail: {e}")
 
         raise VideoDownloadError(
             "TikTok: tất cả backend đều thất bại.\n"

@@ -24,9 +24,9 @@ from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
 # Tối thiểu giữa 2 lần edit — tránh Telegram "Too Many Requests"
-MIN_EDIT_INTERVAL = 2.0
+MIN_EDIT_INTERVAL = 1.0
 # Bỏ qua update nếu % tăng < ngưỡng này (kể cả đã đến interval)
-MIN_PCT_DELTA = 2.0
+MIN_PCT_DELTA = 1.0
 
 
 class TelegramProgress:
