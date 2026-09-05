@@ -4,6 +4,7 @@ import html
 import asyncio
 import threading
 import time
+import uuid
 from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -25,6 +26,19 @@ from downloader import (
     YOUTUBE_PLAYER_CLIENTS,
 )
 from image_processor import enhance_image, beautify_image
+from tools import (
+    generate_qr,
+    make_sticker,
+    video_to_gif,
+    add_meme_text,
+    compress_image,
+    extract_colors,
+    add_watermark,
+    get_youtube_thumbnail,
+    roll_dice,
+    image_to_ascii,
+    extract_youtube_id,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ADMIN — Theo dõi user nào gửi link nào
@@ -57,8 +71,11 @@ def _log_activity(
 # ═══════════════════════════════════════════════════════════════════════════════
 #  IMAGE PROCESSING — User mode tracking
 # ═══════════════════════════════════════════════════════════════════════════════
-# _user_mode[user_id] = "enhance" | "beautify" | None
+# _user_mode[user_id] = mode string
+# Modes nhận ảnh: enhance, beautify, sticker, meme, compress, watermark, colors, ascii
+# _user_args[user_id] = dict các tham số tùy chọn (meme text, watermark text, ...)
 _user_mode: dict = {}
+_user_args: dict = {}
 
 # Regex phát hiện URL trong tin nhắn văn bản
 URL_REGEX = re.compile(r"https?://[^\s]+", re.IGNORECASE)
@@ -76,9 +93,20 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "🖼️ <b>Xử lý ảnh:</b>\n"
         "• 🔍 /enhance — Làm nét ảnh (sharpen + tăng màu)\n"
         "• ✨ /beautify — Làm đẹp ảnh (mịn da + sáng + hồng)\n\n"
+        "🛠️ <b>10 Tools hay:</b>\n"
+        "• 📱 /qr — Tạo QR code\n"
+        "• 🏷️ /sticker — Ảnh → sticker Telegram\n"
+        "• 🎞️ /gif — Video → GIF\n"
+        "• 😂 /meme — Thêm text meme lên ảnh\n"
+        "• 📦 /compress — Nén ảnh giảm dung lượng\n"
+        "• 🎨 /colors — Trích xuất bảng màu\n"
+        "• 💧 /watermark — Thêm watermark lên ảnh\n"
+        "• 🖼️ /thumb — Tải thumbnail YouTube\n"
+        "• 🎲 /roll — Random dice\n"
+        "• ⌨️ /ascii — Ảnh → ASCII art\n\n"
         "📌 <b>Cách sử dụng:</b>\n"
         "• Gửi link video → tải tự động\n"
-        "• Gõ /enhance hoặc /beautify → gửi ảnh → nhận ảnh đã xử lý\n\n"
+        "• Gõ lệnh tool → gửi ảnh → nhận kết quả\n\n"
         "⚠️ <i>Lưu ý: Telegram Bot giới hạn file tối đa <b>50MB</b>.</i>"
     )
     if update.message:
@@ -203,13 +231,296 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     if user_id in _user_mode:
         del _user_mode[user_id]
-        await update.message.reply_text("✅ Đã hủy chế độ xử lý ảnh.")
+        _user_args.pop(user_id, None)
+        await update.message.reply_text("✅ Đã hủy chế độ hiện tại.")
     else:
-        await update.message.reply_text("Không có chế độ nào đang актив.")
+        await update.message.reply_text("Không có chế độ nào đang hoạt động.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  10 TOOLS — Command handlers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def qr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """TOOL 1: /qr <text> — tạo QR code PNG."""
+    if not update.message:
+        return
+    args = context.args if context.args else []
+    if not args:
+        await update.message.reply_text(
+            "📱 <b>QR CODE</b>\n\n"
+            "Cú pháp: <code>/qr &lt;nội dung&gt;</code>\n\n"
+            "VD: <code>/qr https://github.com</code>\n"
+            "VD: <code>/qr Hello World</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    text = " ".join(args)
+    output_path = str(DOWNLOAD_DIR / f"qr_{uuid.uuid4().hex[:8]}.png")
+    try:
+        generate_qr(text, output_path)
+        with open(output_path, "rb") as f:
+            await update.message.reply_photo(
+                photo=f,
+                caption=f"📱 QR code cho: <code>{html.escape(text[:100])}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception as e:
+        logger.error(f"QR lỗi: {e}", exc_info=True)
+        await update.message.reply_text("❌ Không thể tạo QR code. Vui lòng thử lại!")
+    finally:
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
+
+async def sticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """TOOL 2: /sticker — gửi ảnh → nhận sticker 512x512."""
+    if not update.message:
+        return
+    _user_mode[update.effective_user.id] = "sticker"
+    await update.message.reply_text(
+        "🏷️ <b>STICKER MAKER</b>\n\n"
+        "📸 Gửi ảnh để chuyển thành sticker 512x512!\n\n"
+        "❌ Gõ /cancel để hủy.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """TOOL 3: /gif — reply video với /gif → chuyển thành GIF 5s đầu."""
+    if not update.message:
+        return
+    msg = update.message
+
+    # Cách 1: reply vào video đã gửi
+    if msg.reply_to_message and msg.reply_to_message.video:
+        await _process_gif(msg.reply_to_message, context)
+        return
+    if msg.reply_to_message and msg.reply_to_message.document and msg.reply_to_message.document.mime_type and "video" in msg.reply_to_message.document.mime_type:
+        await _process_gif(msg.reply_to_message, context)
+        return
+
+    await msg.reply_text(
+        "🎞️ <b>GIF MAKER</b>\n\n"
+        "Cách dùng: <b>Reply</b> một video bất kỳ với lệnh <code>/gif</code>.\n\n"
+        "• Bot sẽ lấy 5 giây đầu chuyển thành GIF.\n"
+        "• Hỗ trợ video TikTok/YouTube đã tải qua bot.\n\n"
+        "💡 <i>Tip: Tải video trước bằng cách gửi link, sau đó reply video đó với /gif.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _process_gif(reply_msg, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tải video từ reply, chuyển sang GIF, gửi lại."""
+    chat_id = reply_msg.chat_id
+    status_msg = None
+    video_path = None
+    gif_path = None
+    try:
+        status_msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text="🎞️ <b>Đang chuyển video → GIF...</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        tg_file = await context.bot.get_file(reply_msg.video.file_id)
+        unique_id = uuid.uuid4().hex[:8]
+        video_path = str(DOWNLOAD_DIR / f"gif_in_{unique_id}.mp4")
+        await tg_file.download_to_drive(video_path)
+
+        gif_path = str(DOWNLOAD_DIR / f"gif_out_{unique_id}.gif")
+        await asyncio.to_thread(video_to_gif, video_path, gif_path)
+
+        with open(gif_path, "rb") as f:
+            await context.bot.send_animation(
+                chat_id=chat_id,
+                animation=f,
+                caption="🎞️ GIF đã sẵn sàng!",
+            )
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"GIF lỗi: {e}", exc_info=True)
+        if status_msg:
+            try:
+                await status_msg.edit_text("❌ Không thể chuyển video thành GIF. Video có thể quá dài!")
+            except Exception:
+                pass
+    finally:
+        for p in [video_path, gif_path]:
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+
+async def meme_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """TOOL 4: /meme <top> | <bottom> — gửi ảnh → meme."""
+    if not update.message:
+        return
+    args = " ".join(context.args) if context.args else ""
+
+    if not args:
+        await update.message.reply_text(
+            "😂 <b>MEME GENERATOR</b>\n\n"
+            "Cú pháp: <code>/meme &lt;text trên&gt; | &lt;text dưới&gt;</code>\n\n"
+            "VD: <code>/meme KHI BẠN ĐANG CODE | VÀ BUG XUẤT HIỆN</code>\n\n"
+            "📸 Sau đó gửi ảnh để tạo meme!",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Parse top | bottom
+    if "|" in args:
+        top, bottom = args.split("|", 1)
+    else:
+        top, bottom = args, ""
+
+    _user_mode[update.effective_user.id] = "meme"
+    _user_args[update.effective_user.id] = {
+        "top": top.strip(),
+        "bottom": bottom.strip(),
+    }
+    await update.message.reply_text(
+        f"😂 <b>MEME GENERATOR</b>\n\n"
+        f"📝 Text trên: <b>{html.escape(top.strip()[:60])}</b>\n"
+        f"📝 Text dưới: <b>{html.escape(bottom.strip()[:60]) if bottom.strip() else '(không có)'}</b>\n\n"
+        "📸 Gửi ảnh để tạo meme!\n"
+        "❌ Gõ /cancel để hủy.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def compress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """TOOL 5: /compress — gửi ảnh → nén."""
+    if not update.message:
+        return
+    _user_mode[update.effective_user.id] = "compress"
+    await update.message.reply_text(
+        "📦 <b>IMAGE COMPRESSOR</b>\n\n"
+        "📸 Gửi ảnh cần nén (mặc định: max 1280px, quality 60%)!\n\n"
+        "❌ Gõ /cancel để hủy.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def colors_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """TOOL 6: /colors — gửi ảnh → bảng màu chủ đạo."""
+    if not update.message:
+        return
+    _user_mode[update.effective_user.id] = "colors"
+    await update.message.reply_text(
+        "🎨 <b>COLOR PALETTE</b>\n\n"
+        "📸 Gửi ảnh cần phân tích màu!\n\n"
+        "❌ Gõ /cancel để hủy.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def watermark_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """TOOL 7: /watermark <text> — gửi ảnh → watermark."""
+    if not update.message:
+        return
+    args = " ".join(context.args) if context.args else ""
+
+    if not args:
+        await update.message.reply_text(
+            "💧 <b>WATERMARK</b>\n\n"
+            "Cú pháp: <code>/watermark &lt;text&gt;</code>\n\n"
+            "VD: <code>/watermark @MyChannel</code>\n\n"
+            "📸 Sau đó gửi ảnh cần thêm watermark!",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    _user_mode[update.effective_user.id] = "watermark"
+    _user_args[update.effective_user.id] = {"text": args.strip()[:50]}
+    await update.message.reply_text(
+        f"💧 <b>WATERMARK</b>\n\n"
+        f"📝 Watermark: <b>{html.escape(args.strip()[:50])}</b>\n\n"
+        "📸 Gửi ảnh cần thêm watermark!\n"
+        "❌ Gõ /cancel để hủy.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def thumb_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """TOOL 8: /thumb <yt_url> — tải thumbnail YouTube."""
+    if not update.message:
+        return
+    args = " ".join(context.args) if context.args else ""
+
+    if not args:
+        await update.message.reply_text(
+            "🖼️ <b>YOUTUBE THUMBNAIL</b>\n\n"
+            "Cú pháp: <code>/thumb &lt;link YouTube&gt;</code>\n\n"
+            "VD: <code>/thumb https://youtu.be/dQw4w9WgXcQ</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    video_id = extract_youtube_id(args)
+    if not video_id:
+        await update.message.reply_text(
+            "❌ Không nhận diện được link YouTube! Vui lòng thử lại.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    output_path = str(DOWNLOAD_DIR / f"thumb_{uuid.uuid4().hex[:8]}.jpg")
+    try:
+        get_youtube_thumbnail(video_id, output_path)
+        with open(output_path, "rb") as f:
+            await update.message.reply_photo(
+                photo=f,
+                caption=f"🖼️ Thumbnail YouTube (<code>{video_id}</code>)",
+                parse_mode=ParseMode.HTML,
+            )
+    except Exception as e:
+        logger.error(f"Thumbnail lỗi: {e}", exc_info=True)
+        await update.message.reply_text(
+            "❌ Không thể tải thumbnail. Video có thể không tồn tại!",
+            parse_mode=ParseMode.HTML,
+        )
+    finally:
+        if os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
+
+async def roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """TOOL 9: /roll [NdM] — random dice."""
+    if not update.message:
+        return
+    expression = " ".join(context.args) if context.args else "1d6"
+    result = roll_dice(expression)
+    await update.message.reply_text(result, parse_mode=ParseMode.HTML)
+
+
+async def ascii_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """TOOL 10: /ascii — gửi ảnh → ASCII art."""
+    if not update.message:
+        return
+    _user_mode[update.effective_user.id] = "ascii"
+    await update.message.reply_text(
+        "⌨️ <b>ASCII ART</b>\n\n"
+        "📸 Gửi ảnh cần chuyển thành ASCII art!\n\n"
+        "❌ Gõ /cancel để hủy.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Xử lý ảnh gửi từ user — làm nét hoặc làm đẹp tùy chế độ."""
+    """Xử lý ảnh gửi từ user — tùy chế độ đã kích hoạt."""
     if not update.message or not update.message.photo:
         return
 
@@ -220,8 +531,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not mode:
         return  # User không ở chế độ nào → bỏ qua
 
-    # Xóa mode ngay sau khi nhận ảnh
+    # Xóa mode & args ngay sau khi nhận ảnh
     del _user_mode[user_id]
+    args = _user_args.pop(user_id, {})
 
     chat_id = update.effective_chat.id
     status_msg = None
@@ -229,39 +541,102 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     output_path = None
 
     try:
-        # Gửi tin nhắn đang xử lý
-        mode_text = "làm nét" if mode == "enhance" else "làm đẹp"
+        # Mô tả chế độ đang xử lý
+        mode_descriptions = {
+            "enhance": "🔍 Đang làm nét ảnh...",
+            "beautify": "✨ Đang làm đẹp ảnh...",
+            "sticker": "🏷️ Đang tạo sticker...",
+            "meme": "😂 Đang tạo meme...",
+            "compress": "📦 Đang nén ảnh...",
+            "watermark": "💧 Đang thêm watermark...",
+            "colors": "🎨 Đang phân tích màu...",
+            "ascii": "⌨️ Đang chuyển ASCII art...",
+        }
         status_msg = await update.message.reply_text(
-            f"🖌️ <b>Đang {mode_text} ảnh...</b>",
+            f"<b>{mode_descriptions.get(mode, 'Đang xử lý...')}</b>",
             parse_mode=ParseMode.HTML,
         )
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
 
-        # Tải ảnh lớn nhất (photo[0] là lớn nhất trong Telegram)
+        # Tải ảnh lớn nhất (photo[-1] là lớn nhất trong Telegram)
         photo = update.message.photo[-1]
         photo_file = await context.bot.get_file(photo.file_id)
 
-        unique_id = __import__("uuid").uuid4().hex[:8]
+        unique_id = uuid.uuid4().hex[:8]
         input_path = str(DOWNLOAD_DIR / f"img_in_{unique_id}.jpg")
         output_path = str(DOWNLOAD_DIR / f"img_out_{unique_id}.jpg")
 
         await photo_file.download_to_drive(input_path)
 
-        # Xử lý ảnh
+        # ─── Xử lý theo từng mode ───────────────────────────────────────────
         if mode == "enhance":
-            enhance_image(input_path, output_path)
-        else:
-            beautify_image(input_path, output_path)
+            await asyncio.to_thread(enhance_image, input_path, output_path)
+            with open(output_path, "rb") as f:
+                await context.bot.send_photo(chat_id=chat_id, photo=f, caption="🔍 Ảnh đã được làm nét!")
 
-        # Gửi ảnh đã xử lý
-        with open(output_path, "rb") as f:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=f,
-                caption=f"{'🔍' if mode == 'enhance' else '✨'} Ảnh đã được {mode_text}!",
+        elif mode == "beautify":
+            await asyncio.to_thread(beautify_image, input_path, output_path)
+            with open(output_path, "rb") as f:
+                await context.bot.send_photo(chat_id=chat_id, photo=f, caption="✨ Ảnh đã được làm đẹp!")
+
+        elif mode == "sticker":
+            await asyncio.to_thread(make_sticker, input_path, output_path)
+            with open(output_path, "rb") as f:
+                await context.bot.send_sticker(chat_id=chat_id, sticker=f)
+
+        elif mode == "meme":
+            top = args.get("top", "")
+            bottom = args.get("bottom", "")
+            await asyncio.to_thread(add_meme_text, input_path, output_path, top, bottom)
+            with open(output_path, "rb") as f:
+                await context.bot.send_photo(chat_id=chat_id, photo=f, caption="😂 Meme đã sẵn sàng!")
+
+        elif mode == "compress":
+            _, size_before, size_after = await asyncio.to_thread(
+                compress_image, input_path, output_path,
             )
+            saved_pct = round((1 - size_after / size_before) * 100, 1) if size_before else 0
+            with open(output_path, "rb") as f:
+                await context.bot.send_photo(
+                    chat_id=chat_id, photo=f,
+                    caption=(
+                        f"📦 Ảnh đã nén!\n"
+                        f"💾 {size_before / 1024:.0f} KB → {size_after / 1024:.0f} KB "
+                        f"(giảm {saved_pct}%)"
+                    ),
+                )
 
-        # Xóa tin nhắn trạng thái
+        elif mode == "watermark":
+            wm_text = args.get("text", "@MyBot")
+            await asyncio.to_thread(add_watermark, input_path, output_path, wm_text)
+            with open(output_path, "rb") as f:
+                await context.bot.send_photo(
+                    chat_id=chat_id, photo=f,
+                    caption=f"💧 Đã thêm watermark: {html.escape(wm_text)}",
+                )
+
+        elif mode == "colors":
+            colors = await asyncio.to_thread(extract_colors, input_path)
+            lines = ["🎨 <b>BẢNG MÀU CHỦ ĐẠO</b>", ""]
+            for c in colors:
+                lines.append(f"▪️ <code>{c['hex']}</code> — {c['percent']}%")
+            # Telegram không render màu nền, gửi text + gửi ảnh gốc lại không cần
+            if status_msg:
+                await status_msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
+                status_msg = None  # đã edit thành kết quả, không delete nữa
+
+        elif mode == "ascii":
+            ascii_text = await asyncio.to_thread(image_to_ascii, input_path, 60)
+            # Gửi trong code block
+            safe_ascii = ascii_text.replace("`", "'")
+            message = f"```\n{safe_ascii}\n```"
+            if len(message) > 4000:
+                message = message[:3990] + "\n```"
+            if status_msg:
+                await status_msg.edit_text(message)
+                status_msg = None
+
+        # Xóa tin nhắn trạng thái (nếu chưa edit thành kết quả)
         if status_msg:
             try:
                 await status_msg.delete()
@@ -272,7 +647,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     except Exception as e:
         logger.error(f"Lỗi xử lý ảnh {mode}: {e}", exc_info=True)
-        error_text = f"❌ Không thể {mode_text} ảnh. Vui lòng thử lại với ảnh khác!"
+        error_text = "❌ Không thể xử lý ảnh. Vui lòng thử lại với ảnh khác!"
         if status_msg:
             try:
                 await status_msg.edit_text(error_text)
@@ -527,6 +902,17 @@ def main() -> None:
     application.add_handler(CommandHandler("enhance", enhance_command))
     application.add_handler(CommandHandler("beautify", beautify_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
+    # 10 Tools
+    application.add_handler(CommandHandler("qr", qr_command))
+    application.add_handler(CommandHandler("sticker", sticker_command))
+    application.add_handler(CommandHandler("gif", gif_command))
+    application.add_handler(CommandHandler("meme", meme_command))
+    application.add_handler(CommandHandler("compress", compress_command))
+    application.add_handler(CommandHandler("colors", colors_command))
+    application.add_handler(CommandHandler("watermark", watermark_command))
+    application.add_handler(CommandHandler("thumb", thumb_command))
+    application.add_handler(CommandHandler("roll", roll_command))
+    application.add_handler(CommandHandler("ascii", ascii_command))
 
     # Đăng ký Photo Handler — bắt ảnh trước khi URL handler
     application.add_handler(
