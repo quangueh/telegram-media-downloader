@@ -15,6 +15,7 @@ YÊU CẦU khi deploy lên Render/cloud:
 
 import os
 import re
+import time
 import uuid
 import asyncio
 import tempfile
@@ -54,6 +55,9 @@ PIPED_INSTANCES = [
 ]
 
 TIKTOK_FALLBACK_API = "https://www.tikwm.com/api/"
+
+# Kiểu callback tiến trình: callable(pct_or_None, text) — khai báo kiểu lỏng để tránh circular import
+ProgressCB = Optional[object]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -127,21 +131,40 @@ async def _http_download_stream(
     url: str,
     dest: Path,
     timeout: int = 120,
+    progress_cb: ProgressCB = None,
+    label: str = "⬇️ Đang tải",
 ) -> int:
     """Tải file mp4 từ URL bằng httpx streaming. Trả về kích thước bytes. Ném VideoTooLargeError nếu vượt giới hạn."""
     downloaded = 0
+    last_report = 0.0
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(timeout, connect=15),
         follow_redirects=True,
     ) as client:
         async with client.stream("GET", url) as resp:
             resp.raise_for_status()
+            total = int(resp.headers.get("content-length") or 0)
             with open(dest, "wb") as f:
                 async for chunk in resp.aiter_bytes(chunk_size=1 << 16):
                     downloaded += len(chunk)
                     if downloaded > MAX_FILE_SIZE:
                         raise VideoTooLargeError(downloaded, MAX_FILE_SIZE)
                     f.write(chunk)
+                    # Report mỗi 2s để throttle từ phía stream luôn
+                    if progress_cb:
+                        now = time.monotonic()
+                        if now - last_report >= 2.0:
+                            last_report = now
+                            if total > 0:
+                                pct = downloaded / total * 100
+                                text = f"{label}: {_fmt_mb(downloaded)}/{_fmt_mb(total)}"
+                            else:
+                                pct = None
+                                text = f"{label}: {_fmt_mb(downloaded)}"
+                            try:
+                                progress_cb(pct, text)
+                            except Exception:
+                                pass
     return downloaded
 
 
@@ -149,7 +172,17 @@ async def _http_download_stream(
 #  BACKEND 1: yt-dlp (bgutil + player clients + cookies)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _build_ytdlp_opts(url: str, target_dir: Path, unique_id: str) -> dict:
+def _fmt_mb(num_bytes: float) -> str:
+    """Format bytes → MB string."""
+    return f"{num_bytes / (1024 * 1024):.1f}MB"
+
+
+def _build_ytdlp_opts(
+    url: str,
+    target_dir: Path,
+    unique_id: str,
+    progress_cb: ProgressCB = None,
+) -> dict:
     """Xây dựng ydl_opts cho yt-dlp, tối ưu theo nền tảng."""
     outtmpl = str(target_dir / f"{_safe_filename('%(title)s', unique_id)}_{unique_id}.%(ext)s")
 
@@ -191,11 +224,36 @@ def _build_ytdlp_opts(url: str, target_dir: Path, unique_id: str) -> dict:
             opts["cookiefile"] = str(cookie_file)
         logger.info("YouTube cookies loaded từ YOUTUBE_COOKIES env var.")
 
+    # Progress hook: report % tải về qua callback (nếu có)
+    if progress_cb:
+        def _ytdlp_progress_hook(d: dict) -> None:
+            try:
+                status = d.get("status")
+                if status == "downloading":
+                    downloaded = d.get("downloaded_bytes") or 0
+                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                    speed = d.get("speed") or 0
+                    speed_str = f" — {_fmt_mb(speed)}/s" if speed else ""
+                    if total > 0:
+                        pct = downloaded / total * 100
+                        text = f"⬇️ Đang tải: {_fmt_mb(downloaded)}/{_fmt_mb(total)}{speed_str}"
+                    else:
+                        pct = None
+                        text = f"⬇️ Đang tải: {_fmt_mb(downloaded)}{speed_str}"
+                    progress_cb(pct, text)
+                elif status == "finished":
+                    progress_cb(None, "🔧 Đang gộp video + audio (FFmpeg)...")
+            except Exception:
+                pass  # Progress lỗi không được làm hỏng download
+        opts["progress_hooks"] = [_ytdlp_progress_hook]
+
     return opts
 
 
 def _sync_ytdlp_download(
-    url: str, output_dir: Union[str, Path]
+    url: str,
+    output_dir: Union[str, Path],
+    progress_cb: ProgressCB = None,
 ) -> Tuple[str, str, int]:
     """
     Backend chính: yt-dlp sync (chạy trong executor).
@@ -204,7 +262,7 @@ def _sync_ytdlp_download(
     target_dir = Path(output_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     unique_id = uuid.uuid4().hex[:10]
-    opts = _build_ytdlp_opts(url, target_dir, unique_id)
+    opts = _build_ytdlp_opts(url, target_dir, unique_id, progress_cb)
 
     downloaded_filepath: Optional[str] = None
 
@@ -268,7 +326,9 @@ def _sync_ytdlp_download(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _download_via_piped(
-    url: str, output_dir: Path
+    url: str,
+    output_dir: Path,
+    progress_cb: ProgressCB = None,
 ) -> Optional[Tuple[str, str, int]]:
     """Tải YouTube video qua Piped API — proxy stream không bị bot-check."""
     video_id = _extract_youtube_id(url)
@@ -337,7 +397,10 @@ async def _download_via_piped(
         video_path = target_dir / f"{safe_title}_{unique_id}_video.mp4"
 
         try:
-            await _http_download_stream(stream_url, video_path)
+            await _http_download_stream(
+                stream_url, video_path, progress_cb=progress_cb,
+                label="⬇️ Tải video (Piped)",
+            )
         except VideoTooLargeError:
             raise
         except Exception as e:
@@ -356,7 +419,10 @@ async def _download_via_piped(
                 audio_url = audio_m4a[0].get("url")
                 audio_path = target_dir / f"{safe_title}_{unique_id}_audio.m4a"
                 try:
-                    await _http_download_stream(audio_url, audio_path)
+                    await _http_download_stream(
+                        audio_url, audio_path, progress_cb=progress_cb,
+                        label="⬇️ Tải audio (Piped)",
+                    )
                 except Exception as e:
                     logger.warning(f"Piped [{instance}] tải audio fail: {e}")
                     final_path = str(video_path)
@@ -411,7 +477,9 @@ async def _download_via_piped(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _download_via_tikwm(
-    url: str, output_dir: Path
+    url: str,
+    output_dir: Path,
+    progress_cb: ProgressCB = None,
 ) -> Optional[Tuple[str, str, int]]:
     """Tải TikTok video không watermark qua tikwm API."""
     match = TIKTOK_URL_PATTERN.search(url)
@@ -459,7 +527,10 @@ async def _download_via_tikwm(
     file_path = target_dir / f"{safe_title}_{unique_id}.mp4"
 
     try:
-        await _http_download_stream(video_url, file_path)
+        await _http_download_stream(
+            video_url, file_path, progress_cb=progress_cb,
+            label="⬇️ Tải TikTok (tikwm)",
+        )
     except VideoTooLargeError:
         _cleanup_leftovers(target_dir, unique_id)
         raise
@@ -479,6 +550,7 @@ async def _download_via_tikwm(
 async def extract_and_download(
     url: str,
     output_path: Optional[Union[str, Path]] = None,
+    progress_cb: ProgressCB = None,
 ) -> Tuple[str, str, int]:
     """
     Router tải video đa nền tảng.
@@ -486,10 +558,21 @@ async def extract_and_download(
     - YouTube: yt-dlp → Piped API → VideoDownloadError
     - TikTok: yt-dlp → tikwm API → VideoDownloadError
     - Khác: yt-dlp → VideoDownloadError
+
+    progress_cb: callable(pct_or_None, text) — thread-safe, tùy chọn.
     """
     target_dir = Path(output_path) if output_path else DOWNLOAD_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     loop = asyncio.get_running_loop()
+
+    # Wrapper: callback chạy từ executor thread → cần schedule về loop của bot
+    def _cb(pct, text):
+        if not progress_cb:
+            return
+        try:
+            progress_cb(pct, text)
+        except Exception:
+            pass
 
     # ── YouTube routing ──
     if _is_youtube_url(url):
@@ -498,7 +581,7 @@ async def extract_and_download(
         # Backend 1: yt-dlp (bgutil auto + player clients + cookies)
         try:
             result = await loop.run_in_executor(
-                None, _sync_ytdlp_download, url, target_dir
+                None, _sync_ytdlp_download, url, target_dir, _cb
             )
             if result:
                 return result
@@ -513,7 +596,7 @@ async def extract_and_download(
 
         # Backend 2: Piped API
         try:
-            result = await _download_via_piped(url, target_dir)
+            result = await _download_via_piped(url, target_dir, _cb)
             if result:
                 logger.info("YouTube tải thành công qua Piped API")
                 return result
@@ -532,7 +615,7 @@ async def extract_and_download(
     if _is_tiktok_url(url):
         try:
             result = await loop.run_in_executor(
-                None, _sync_ytdlp_download, url, target_dir
+                None, _sync_ytdlp_download, url, target_dir, _cb
             )
             if result:
                 return result
@@ -544,7 +627,7 @@ async def extract_and_download(
             logger.warning(f"yt-dlp TikTok fail, thử tikwm API: {e}")
 
         # Fallback: tikwm API
-        result = await _download_via_tikwm(url, target_dir)
+        result = await _download_via_tikwm(url, target_dir, _cb)
         if result:
             return result
 
@@ -552,7 +635,7 @@ async def extract_and_download(
 
     # ── Facebook / nền tảng khác: yt-dlp mặc định ──
     result = await loop.run_in_executor(
-        None, _sync_ytdlp_download, url, target_dir
+        None, _sync_ytdlp_download, url, target_dir, _cb
     )
     if result:
         return result

@@ -19,6 +19,7 @@ Yêu cầu: Pillow, NumPy, httpx, qrcode, FFmpeg (system)
 import random
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import httpx
@@ -99,11 +100,13 @@ def video_to_gif(
     output_path: str,
     start: float = 0.0,
     duration: float = 5.0,
+    on_progress=None,
 ) -> str:
     """
     Chuyển video → GIF bằng FFmpeg.
     - Mặc định lấy 5 giây đầu
     - 12fps, scale 480px width, palette-gen để GIF đẹp màu
+    - on_progress(pct, text) — optional, đọc từ -progress pipe
     """
     cmd = [
         "ffmpeg", "-y",
@@ -112,13 +115,50 @@ def video_to_gif(
         "-i", input_path,
         "-vf",
         "fps=12,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+        "-progress", "pipe:1", "-nostats",
+        "-loglevel", "error",
         output_path,
     ]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=60,
+
+    def report(pct, text):
+        if on_progress:
+            try:
+                on_progress(pct, text)
+            except Exception:
+                pass
+
+    report(2, "🎞️ Đang khởi động FFmpeg...")
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
     )
-    if result.returncode != 0:
-        raise RuntimeError(f"FFmpeg lỗi: {result.stderr[-300:]}")
+    last_report_time = 0.0
+    try:
+        # Đọc -progress pipe: các dòng key=value (out_time_us, out_time_ms, speed...)
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith("out_time_us="):
+                try:
+                    out_us = int(line.split("=", 1)[1])
+                    pct = min(99.0, out_us / (duration * 1_000_000) * 100)
+                    # Throttle: chỉ report khi >= 3% tiến bộ
+                    now = time.monotonic()
+                    if now - last_report_time >= 2.0:
+                        last_report_time = now
+                        report(pct, f"🎞️ Đang chuyển: {pct:.0f}% ({duration}s)")
+                except ValueError:
+                    pass
+        proc.wait(timeout=30)
+    except Exception:
+        proc.kill()
+        raise
+
+    if proc.returncode != 0:
+        stderr = proc.stderr.read()[-300:] if proc.stderr else "unknown"
+        raise RuntimeError(f"FFmpeg lỗi: {stderr}")
+
+    report(100, "✅ Hoàn tất GIF")
     return output_path
 
 

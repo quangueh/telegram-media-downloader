@@ -26,6 +26,7 @@ from downloader import (
     YOUTUBE_PLAYER_CLIENTS,
 )
 from image_processor import enhance_image, beautify_image
+from progress import TelegramProgress
 from tools import (
     generate_qr,
     make_sticker,
@@ -317,22 +318,25 @@ async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def _process_gif(reply_msg, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Tải video từ reply, chuyển sang GIF, gửi lại."""
     chat_id = reply_msg.chat_id
-    status_msg = None
+    progress = None
     video_path = None
     gif_path = None
     try:
-        status_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text="🎞️ <b>Đang chuyển video → GIF...</b>",
-            parse_mode=ParseMode.HTML,
+        progress = TelegramProgress(
+            context, chat_id,
+            initial_text="🎞️ <b>Đang chuyển video → GIF...</b>",
+            title="🎞️ GIF Maker",
         )
+        await progress._create_task
         tg_file = await context.bot.get_file(reply_msg.video.file_id)
         unique_id = uuid.uuid4().hex[:8]
         video_path = str(DOWNLOAD_DIR / f"gif_in_{unique_id}.mp4")
         await tg_file.download_to_drive(video_path)
 
         gif_path = str(DOWNLOAD_DIR / f"gif_out_{unique_id}.gif")
-        await asyncio.to_thread(video_to_gif, video_path, gif_path)
+        await asyncio.to_thread(
+            video_to_gif, video_path, gif_path, 0.0, 5.0, progress.update_sync
+        )
 
         with open(gif_path, "rb") as f:
             await context.bot.send_animation(
@@ -340,18 +344,22 @@ async def _process_gif(reply_msg, context: ContextTypes.DEFAULT_TYPE) -> None:
                 animation=f,
                 caption="🎞️ GIF đã sẵn sàng!",
             )
-        if status_msg:
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
+        try:
+            await progress.delete()
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"GIF lỗi: {e}", exc_info=True)
-        if status_msg:
+        if progress and progress._message:
             try:
-                await status_msg.edit_text("❌ Không thể chuyển video thành GIF. Video có thể quá dài!")
+                await progress.fail("❌ Không thể chuyển video thành GIF. Video có thể quá dài!")
             except Exception:
                 pass
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ Không thể chuyển video thành GIF. Video có thể quá dài!",
+            )
     finally:
         for p in [video_path, gif_path]:
             if p and os.path.exists(p):
@@ -536,9 +544,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     args = _user_args.pop(user_id, {})
 
     chat_id = update.effective_chat.id
-    status_msg = None
     input_path = None
     output_path = None
+    progress = None
+    result_in_progress = False  # True nếu kết quả được edit vào progress msg (colors/ascii)
 
     try:
         # Mô tả chế độ đang xử lý
@@ -552,10 +561,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "colors": "🎨 Đang phân tích màu...",
             "ascii": "⌨️ Đang chuyển ASCII art...",
         }
-        status_msg = await update.message.reply_text(
-            f"<b>{mode_descriptions.get(mode, 'Đang xử lý...')}</b>",
-            parse_mode=ParseMode.HTML,
+        progress = TelegramProgress(
+            context, chat_id,
+            initial_text=f"<b>{mode_descriptions.get(mode, 'Đang xử lý...')}</b>",
         )
+        await progress._create_task
+
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
 
         # Tải ảnh lớn nhất (photo[-1] là lớn nhất trong Telegram)
@@ -570,12 +581,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         # ─── Xử lý theo từng mode ───────────────────────────────────────────
         if mode == "enhance":
-            await asyncio.to_thread(enhance_image, input_path, output_path)
+            await asyncio.to_thread(enhance_image, input_path, output_path, progress.update_sync)
             with open(output_path, "rb") as f:
                 await context.bot.send_photo(chat_id=chat_id, photo=f, caption="🔍 Ảnh đã được làm nét!")
 
         elif mode == "beautify":
-            await asyncio.to_thread(beautify_image, input_path, output_path)
+            await asyncio.to_thread(beautify_image, input_path, output_path, progress.update_sync)
             with open(output_path, "rb") as f:
                 await context.bot.send_photo(chat_id=chat_id, photo=f, caption="✨ Ảnh đã được làm đẹp!")
 
@@ -620,10 +631,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             lines = ["🎨 <b>BẢNG MÀU CHỦ ĐẠO</b>", ""]
             for c in colors:
                 lines.append(f"▪️ <code>{c['hex']}</code> — {c['percent']}%")
-            # Telegram không render màu nền, gửi text + gửi ảnh gốc lại không cần
-            if status_msg:
-                await status_msg.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
-                status_msg = None  # đã edit thành kết quả, không delete nữa
+            # Kết quả nằm trong chính progress message → KHÔNG delete
+            await progress.finish("\n".join(lines))
+            result_in_progress = True
 
         elif mode == "ascii":
             ascii_text = await asyncio.to_thread(image_to_ascii, input_path, 60)
@@ -632,14 +642,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             message = f"```\n{safe_ascii}\n```"
             if len(message) > 4000:
                 message = message[:3990] + "\n```"
-            if status_msg:
-                await status_msg.edit_text(message)
-                status_msg = None
+            await progress.finish(message)
+            result_in_progress = True
 
-        # Xóa tin nhắn trạng thái (nếu chưa edit thành kết quả)
-        if status_msg:
+        # Xóa tin nhắn progress sau khi gửi kết quả (trừ khi kết quả nằm trong nó)
+        if not result_in_progress:
             try:
-                await status_msg.delete()
+                await progress.delete()
             except Exception:
                 pass
 
@@ -648,9 +657,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         logger.error(f"Lỗi xử lý ảnh {mode}: {e}", exc_info=True)
         error_text = "❌ Không thể xử lý ảnh. Vui lòng thử lại với ảnh khác!"
-        if status_msg:
+        if progress and progress._message:
             try:
-                await status_msg.edit_text(error_text)
+                await progress.fail(error_text)
             except Exception:
                 pass
         else:
@@ -678,7 +687,7 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     url = match.group(0)
     chat_id = update.effective_chat.id
-    status_msg = None
+    progress = None
     downloaded_file = None
 
     # Xác định nền tảng
@@ -693,17 +702,23 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         platform = "Other"
 
     try:
-        # Gửi tin nhắn phản hồi ban đầu
-        status_msg = await update.message.reply_text(
-            "⏳ <b>Đang tải và xử lý video...</b> Vui lòng đợi trong giây lát.",
-            parse_mode=ParseMode.HTML,
+        # Gửi tin nhắn tiến trình — tự cập nhật % trong lúc tải
+        progress = TelegramProgress(
+            context, chat_id,
+            initial_text="⏳ <b>Đang tải và xử lý video...</b>",
+            title=f"🎬 {platform}",
         )
+        # Đợi message được tạo (create_task trong __init__)
+        await progress._create_task
 
         # Hiển thị hành động bot đang tải video
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
 
-        # Gọi hàm tải video bất đồng bộ
-        file_path, title, duration = await extract_and_download(url)
+        # Gọi hàm tải video bất đồng bộ — truyền progress callback
+        def _dl_progress(pct, text):
+            progress.update_sync(pct, text)
+
+        file_path, title, duration = await extract_and_download(url, progress_cb=_dl_progress)
         downloaded_file = file_path
 
         # Chuẩn bị caption an toàn (giới hạn ký tự tối đa của Telegram là 1024)
@@ -715,10 +730,7 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # Cập nhật trạng thái đang upload
         try:
-            await status_msg.edit_text(
-                "🚀 <b>Đang tải video lên Telegram...</b>",
-                parse_mode=ParseMode.HTML,
-            )
+            await progress.finish("🚀 <b>Đang tải video lên Telegram...</b>")
         except Exception:
             pass
 
@@ -736,11 +748,10 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
 
         # Xóa tin nhắn trạng thái sau khi gửi thành công
-        if status_msg:
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
+        try:
+            await progress.delete()
+        except Exception:
+            pass
 
         # Ghi log thành công
         _log_activity(
@@ -762,8 +773,8 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"⚠️ <b>Không thể gửi video:</b>\n{str(e)}\n\n"
             "💡 <i>Gợi ý: Do giới hạn Telegram Bot API là 50MB, bạn hãy thử tải các video ngắn hơn hoặc độ phân giải thấp hơn.</i>"
         )
-        if status_msg:
-            await status_msg.edit_text(error_text, parse_mode=ParseMode.HTML)
+        if progress._message:
+            await progress.fail(error_text)
         else:
             await update.message.reply_text(error_text, parse_mode=ParseMode.HTML)
 
@@ -786,17 +797,17 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "• Đảm bảo liên kết chính xác và có thể truy cập công khai.\n"
             "• Video không bị khóa riêng tư hoặc giới hạn độ tuổi."
         )
-        if status_msg:
-            await status_msg.edit_text(error_text, parse_mode=ParseMode.HTML)
+        if progress._message:
+            await progress.fail(error_text)
         else:
             await update.message.reply_text(error_text, parse_mode=ParseMode.HTML)
 
     except Exception as e:
         logger.error(f"Lỗi không lường trước khi xử lý tin nhắn: {e}", exc_info=True)
         error_text = "❌ Đã có sự cố kỹ thuật xảy ra trong quá trình xử lý. Vui lòng thử lại sau!"
-        if status_msg:
+        if progress and progress._message:
             try:
-                await status_msg.edit_text(error_text)
+                await progress.fail(error_text)
             except Exception:
                 pass
         else:
