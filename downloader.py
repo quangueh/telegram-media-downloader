@@ -45,14 +45,20 @@ YOUTUBE_ID_PATTERN = re.compile(
     r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)([A-Za-z0-9_-]{11})",
 )
 
-# Player client YouTube không yêu cầu PO Token (thứ tự ưu tiên theo test 2026-09-04)
-YOUTUBE_PLAYER_CLIENTS = ["visionos", "android_vr", "tv"]
+# Player client YouTube không yêu cầu PO Token (thứ tự ưu tiên theo test 2026-09-05)
+YOUTUBE_PLAYER_CLIENTS = ["visionos", "android_vr", "android", "tv_embedded", "android_music", "mweb_safari"]
 
-# Piped API instances (fallback, kiểm tra theo thứ tự)
+# Piped API instances (fallback, kiểm tra theo thứ tự — nhiều instance hay chết, thử nhiều)
 PIPED_INSTANCES = [
     "api.piped.projectsegfau.lt",
-    "piped-api.lunar.icu",
     "pipedapi.kavin.rocks",
+    "pipedapi.adminforge.de",
+    "pipedapi.reallyaweso.me",
+    "pipedapi.ducks.party",
+    "api.piped.private.coffee",
+    "pipedapi.moomoo.me",
+    "piped-api.lunar.icu",
+    "pipedapi.leptons.xyz",
 ]
 
 TIKTOK_FALLBACK_API = "https://www.tikwm.com/api/"
@@ -377,8 +383,13 @@ def _build_ytdlp_opts(
     target_dir: Path,
     unique_id: str,
     progress_cb: ProgressCB = None,
+    attempt: int = 0,
 ) -> dict:
-    """Xây dựng ydl_opts cho yt-dlp, tối ưu theo nền tảng."""
+    """Xây dựng ydl_opts cho yt-dlp, tối ưu theo nền tảng.
+
+    attempt=0: giới hạn player clients đã biết (tránh PO token).
+    attempt=1: client mặc định của yt-dlp (fallback khi các client giới hạn bị chặn).
+    """
     outtmpl = str(target_dir / f"{_safe_filename('%(title)s', unique_id)}_{unique_id}.%(ext)s")
 
     # Ưu tiên H.264 + AAC trong mp4 — tương thích mọi thiết bị / Telegram.
@@ -412,9 +423,8 @@ def _build_ytdlp_opts(
         },
     }
 
-    # YouTube: player clients không cần PO token + format H.264 <45MB
+    # YouTube: ưu tiên format H.264 + AAC <45MB (giống nhau ở mọi attempt)
     if _is_youtube_url(url):
-        opts["extractor_args"] = {"youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS}}
         opts["format"] = (
             "best[ext=mp4][vcodec^=avc1][acodec^=mp4a][filesize_approx<45M]/"
             "bestvideo[ext=mp4][vcodec^=avc1][filesize_approx<45M]+bestaudio[ext=m4a]/"
@@ -422,6 +432,10 @@ def _build_ytdlp_opts(
             "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
             "best[ext=mp4]/best"
         )
+        if attempt == 0:
+            opts["extractor_args"] = {"youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS}}
+        else:
+            logger.info("YouTube: dùng player clients mặc định của yt-dlp (attempt 2)")
 
     # Optional: YouTube cookies (Netscape format từ YOUTUBE_COOKIES env var)
     cookies_str = os.getenv("YOUTUBE_COOKIES", "").strip()
@@ -472,78 +486,84 @@ def _sync_ytdlp_download(
     target_dir = Path(output_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     unique_id = uuid.uuid4().hex[:10]
-    opts = _build_ytdlp_opts(url, target_dir, unique_id, progress_cb)
-
-    downloaded_filepath: Optional[str] = None
-
-    def postprocessor_hook(info: dict) -> None:
-        nonlocal downloaded_filepath
-        if info.get("status") == "finished":
-            downloaded_filepath = (
-                info.get("info_dict", {}).get("_filename") or info.get("filepath")
-            )
-
-    opts["postprocessor_hooks"] = [postprocessor_hook]
 
     logger.info(f"yt-dlp đang xử lý: {url}")
 
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info_dict = ydl.extract_info(url, download=False)
-            if not info_dict:
-                raise VideoDownloadError("Không thể lấy thông tin từ URL được cung cấp.")
+    # Retry tối đa 2 lần cho YouTube: lần 1 dùng player clients đã biết,
+    # lần 2 dùng client mặc định của yt-dlp (nếu lần 1 bị chặn).
+    for attempt in range(2):
+        opts = _build_ytdlp_opts(url, target_dir, unique_id, progress_cb, attempt=attempt)
+        downloaded_filepath: Optional[str] = None
 
-            # Kiểm tra kích thước ước lượng nếu có sẵn
-            estimated_size = info_dict.get("filesize") or info_dict.get("filesize_approx")
-            if estimated_size and estimated_size > MAX_FILE_SIZE:
-                raise VideoTooLargeError(estimated_size, MAX_FILE_SIZE)
+        def postprocessor_hook(info: dict) -> None:
+            nonlocal downloaded_filepath
+            if info.get("status") == "finished":
+                downloaded_filepath = (
+                    info.get("info_dict", {}).get("_filename") or info.get("filepath")
+                )
 
-            title = info_dict.get("title", "Video")
-            duration = int(info_dict.get("duration") or 0)
+        opts["postprocessor_hooks"] = [postprocessor_hook]
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info_dict = ydl.extract_info(url, download=False)
+                if not info_dict:
+                    raise VideoDownloadError("Không thể lấy thông tin từ URL được cung cấp.")
 
-            download_info = ydl.extract_info(url, download=True)
+                # Kiểm tra kích thước ước lượng nếu có sẵn
+                estimated_size = info_dict.get("filesize") or info_dict.get("filesize_approx")
+                if estimated_size and estimated_size > MAX_FILE_SIZE:
+                    raise VideoTooLargeError(estimated_size, MAX_FILE_SIZE)
 
-            final_file = downloaded_filepath or ydl.prepare_filename(download_info)
-            if not os.path.exists(final_file):
-                base = os.path.splitext(final_file)[0]
-                for ext in [".mp4", ".mkv", ".webm"]:
-                    if os.path.exists(base + ext):
-                        final_file = base + ext
-                        break
-                else:
-                    candidates = [
-                        f for f in target_dir.glob(f"*{unique_id}*")
-                        if not f.name.endswith((".part", ".ytdl", ".temp"))
-                    ]
-                    if candidates:
-                        final_file = str(candidates[0])
+                title = info_dict.get("title", "Video")
+                duration = int(info_dict.get("duration") or 0)
+
+                download_info = ydl.extract_info(url, download=True)
+
+                final_file = downloaded_filepath or ydl.prepare_filename(download_info)
+                if not os.path.exists(final_file):
+                    base = os.path.splitext(final_file)[0]
+                    for ext in [".mp4", ".mkv", ".webm"]:
+                        if os.path.exists(base + ext):
+                            final_file = base + ext
+                            break
                     else:
-                        raise VideoDownloadError("Không tìm thấy tệp video sau khi tải xuống.")
+                        candidates = [
+                            f for f in target_dir.glob(f"*{unique_id}*")
+                            if not f.name.endswith((".part", ".ytdl", ".temp"))
+                        ]
+                        if candidates:
+                            final_file = str(candidates[0])
+                        else:
+                            raise VideoDownloadError("Không tìm thấy tệp video sau khi tải xuống.")
 
-            actual_size = os.path.getsize(final_file)
-            if actual_size > MAX_FILE_SIZE:
-                try:
-                    os.remove(final_file)
-                except OSError:
-                    pass
-                raise VideoTooLargeError(actual_size, MAX_FILE_SIZE)
+                actual_size = os.path.getsize(final_file)
+                if actual_size > MAX_FILE_SIZE:
+                    try:
+                        os.remove(final_file)
+                    except OSError:
+                        pass
+                    raise VideoTooLargeError(actual_size, MAX_FILE_SIZE)
 
-            # Đảm bảo codec H.264 + AAC trong mp4 — tránh màn trắng / unsupported
-            final_file = _ensure_playable(final_file, progress_cb=progress_cb)
-            actual_size = os.path.getsize(final_file)
-            if actual_size > MAX_FILE_SIZE:
-                try:
-                    os.remove(final_file)
-                except OSError:
-                    pass
-                raise VideoTooLargeError(actual_size, MAX_FILE_SIZE)
+                # Đảm bảo codec H.264 + AAC trong mp4 — tránh màn trắng / unsupported
+                final_file = _ensure_playable(final_file, progress_cb=progress_cb)
+                actual_size = os.path.getsize(final_file)
+                if actual_size > MAX_FILE_SIZE:
+                    try:
+                        os.remove(final_file)
+                    except OSError:
+                        pass
+                    raise VideoTooLargeError(actual_size, MAX_FILE_SIZE)
 
-            logger.info(f"yt-dlp tải thành công: {final_file} ({actual_size / (1024*1024):.1f}MB)")
-            return final_file, title, duration
-    except yt_dlp.utils.DownloadError as e:
-        # Wrap mọi lỗi yt-dlp (DownloadError) thành VideoDownloadError
-        # để router/bot xử lý thống nhất, không lọt ra ngoài
-        raise VideoDownloadError(_clean_error(e)) from e
+                logger.info(f"yt-dlp tải thành công: {final_file} ({actual_size / (1024*1024):.1f}MB)")
+                return final_file, title, duration
+        except yt_dlp.utils.DownloadError as e:
+            if attempt == 0 and _is_youtube_url(url):
+                _cleanup_leftovers(target_dir, unique_id)
+                logger.warning(
+                    f"yt-dlp attempt 1 fail ({_clean_error(e)[:120]}) — thử client mặc định..."
+                )
+                continue
+            raise VideoDownloadError(_clean_error(e)) from e
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -905,15 +925,22 @@ async def extract_and_download(
             if result:
                 logger.info("YouTube tải thành công qua Piped API")
                 return _as_result(result)
+            errors.append("Piped: không lấy được stream (instance không khả dụng)")
         except VideoTooLargeError:
             raise
         except Exception as e:
             errors.append(f"Piped: {_clean_error(e)}")
             logger.warning(f"Piped API fail: {e}")
 
+        hint = (
+            "\n\n💡 <i>Nếu gặp 'Failed to extract any player response' / 'Sign in to confirm"
+            " you're not a bot', hãy cấu hình <code>YOUTUBE_COOKIES</code> (Netscape format)"
+            " để tăng khả năng tải YouTube từ IP máy chủ.</i>"
+        )
         raise VideoDownloadError(
             "YouTube: tất cả backend đều thất bại.\n"
             + "\n".join(f"• {err}" for err in errors)
+            + hint
         )
 
     # ── TikTok routing ──

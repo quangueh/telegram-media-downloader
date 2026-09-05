@@ -270,5 +270,26 @@ class TestTikTokPhotoPost(unittest.TestCase):
         self.assertEqual(MediaResult("photos", ["a.jpg"], "T", 1).paths, ["a.jpg"])
 
 
+class TestYtdlpOptsAttempts(unittest.TestCase):
+    """attempt=0 dùng player clients giới hạn; attempt=1 dùng client mặc định."""
+
+    def test_attempt_variants(self):
+        import tempfile
+        from downloader import _build_ytdlp_opts
+        base = "https://www.youtube.com/watch?v=abc123xyz99"
+        opts0 = _build_ytdlp_opts(base, Path(tempfile.gettempdir()), "uid", attempt=0)
+        opts1 = _build_ytdlp_opts(base, Path(tempfile.gettempdir()), "uid", attempt=1)
+        # attempt 0: extractor_args player_client
+        self.assertIn("player_client", opts0["extractor_args"]["youtube"])
+        # attempt 1: không giới hạn client (dùng mặc định)
+        self.assertNotIn("extractor_args", opts1)
+        # cả 2 vẫn ưu tiên H.264 + AAC
+        self.assertIn("vcodec^=avc1", opts0["format"])
+        self.assertIn("vcodec^=avc1", opts1["format"])
+        # nền tảng khác không có extractor_args
+        opts_gen = _build_ytdlp_opts("https://example.com/x", Path(tempfile.gettempdir()), "uid")
+        self.assertNotIn("extractor_args", opts_gen)
+
+
 if __name__ == "__main__":
     unittest.main()
