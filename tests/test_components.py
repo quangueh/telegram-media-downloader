@@ -291,5 +291,36 @@ class TestYtdlpOptsAttempts(unittest.TestCase):
         self.assertNotIn("extractor_args", opts_gen)
 
 
+class TestRunExecutor(unittest.TestCase):
+    """Executor chạy nền: heartbeat progress + timeout — không treo vô hạn."""
+
+    def test_heartbeat_and_timeout(self):
+        import time as _time
+        from downloader import _run_executor
+
+        calls = []
+
+        def slow_func(*args):
+            _time.sleep(2.0)
+            return "done"
+
+        async def scenario():
+            loop = asyncio.get_running_loop()
+            t0 = _time.monotonic()
+            with self.assertRaises(asyncio.TimeoutError):
+                await _run_executor(
+                    loop, slow_func, (),
+                    progress_cb=lambda p, t: calls.append(t),
+                    timeout=0.5,
+                    heartbeat_interval=0.15,
+                )
+            return _time.monotonic() - t0
+
+        elapsed = asyncio_run(scenario())
+        self.assertGreater(elapsed, 0.4)
+        self.assertTrue(any("Đang xử lý" in c for c in calls), f"thiếu start text: {calls}")
+        self.assertTrue(any("xin chờ" in c for c in calls), f"thiếu heartbeat: {calls}")
+
+
 if __name__ == "__main__":
     unittest.main()

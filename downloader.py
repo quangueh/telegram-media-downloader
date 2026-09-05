@@ -868,6 +868,50 @@ async def _download_via_tikwm(
 #  ROUTER: extract_and_download()
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Thời gian tối đa cho 1 lần chạy yt-dlp (tránh treo vô hạn khi IP bị chặn)
+YTDLP_TIMEOUT = 180
+
+
+async def _run_executor(
+    loop: asyncio.AbstractEventLoop,
+    func,
+    args: tuple,
+    progress_cb: ProgressCB = None,
+    timeout: int = YTDLP_TIMEOUT,
+    start_text: str = "⏳ Đang xử lý...",
+    heartbeat_text: str = "⏳ Vẫn đang xử lý, xin chờ...",
+    heartbeat_interval: float = 15.0,
+):
+    """Chạy func trong executor với heartbeat progress + timeout (tránh 'cứng đơ')."""
+    if progress_cb:
+        try:
+            progress_cb(None, start_text)
+        except Exception:
+            pass
+
+    executor_future = loop.run_in_executor(None, func, *args)
+
+    heartbeat = None
+    if progress_cb:
+        async def beat():
+            while True:
+                try:
+                    await asyncio.sleep(heartbeat_interval)
+                    progress_cb(None, heartbeat_text)
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    pass
+        heartbeat = asyncio.create_task(beat())
+
+    try:
+        # shield: khi timeout, không huỷ executor (thread không thể huỷ) — chỉ bỏ chờ
+        return await asyncio.wait_for(asyncio.shield(executor_future), timeout=timeout)
+    finally:
+        if heartbeat:
+            heartbeat.cancel()
+
+
 async def extract_and_download(
     url: str,
     output_path: Optional[Union[str, Path]] = None,
@@ -905,11 +949,17 @@ async def extract_and_download(
 
         # Backend 1: yt-dlp (bgutil auto + player clients + cookies)
         try:
-            result = await loop.run_in_executor(
-                None, _sync_ytdlp_download, url, target_dir, _cb
+            result = await _run_executor(
+                loop, _sync_ytdlp_download, (url, target_dir, _cb),
+                progress_cb=_cb,
+                start_text="⏳ Đang lấy thông tin video (yt-dlp)...",
+                heartbeat_text="⏳ Vẫn đang xử lý YouTube, xin chờ...",
             )
             if result:
                 return _as_result(result)
+        except asyncio.TimeoutError:
+            errors.append("yt-dlp: quá thời gian xử lý (IP bị chặn hoặc quá chậm)")
+            logger.warning("yt-dlp YouTube timeout, thử Piped API")
         except (VideoTooLargeError, VideoDownloadError) as e:
             errors.append(f"yt-dlp: {_clean_error(e)}")
             if isinstance(e, VideoTooLargeError):
@@ -962,11 +1012,17 @@ async def extract_and_download(
 
         # Backend 2: yt-dlp (fast-fail — retries=1, socket_timeout=15)
         try:
-            result = await loop.run_in_executor(
-                None, _sync_ytdlp_download, url, target_dir, _cb
+            result = await _run_executor(
+                loop, _sync_ytdlp_download, (url, target_dir, _cb),
+                progress_cb=_cb,
+                start_text="⏳ Đang thử tải bằng yt-dlp...",
+                heartbeat_text="⏳ Vẫn đang xử lý, xin chờ...",
             )
             if result:
                 return _as_result(result)
+        except asyncio.TimeoutError:
+            errors.append("yt-dlp: quá thời gian xử lý")
+            logger.warning("yt-dlp TikTok timeout")
         except (VideoTooLargeError, VideoDownloadError) as e:
             errors.append(f"yt-dlp: {_clean_error(e)}")
             if isinstance(e, VideoTooLargeError):
@@ -982,11 +1038,17 @@ async def extract_and_download(
         )
 
     # ── Facebook / nền tảng khác: yt-dlp mặc định ──
-    result = await loop.run_in_executor(
-        None, _sync_ytdlp_download, url, target_dir, _cb
-    )
-    if result:
-        return _as_result(result)
+    try:
+        result = await _run_executor(
+            loop, _sync_ytdlp_download, (url, target_dir, _cb),
+            progress_cb=_cb,
+            start_text="⏳ Đang lấy thông tin video (yt-dlp)...",
+            heartbeat_text="⏳ Vẫn đang xử lý, xin chờ...",
+        )
+        if result:
+            return _as_result(result)
+    except asyncio.TimeoutError:
+        raise VideoDownloadError("Quá thời gian xử lý liên kết này (bị chặn hoặc quá chậm).")
     raise VideoDownloadError("Không thể tải video từ liên kết này.")
 
 
