@@ -27,6 +27,7 @@ from downloader import (
     _is_mp4_container,
     _safe_filename,
     _fmt_mb,
+    _is_youtube_blocked,
 )
 
 FFMPEG_AVAILABLE = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
@@ -268,6 +269,26 @@ class TestTikTokPhotoPost(unittest.TestCase):
     def test_media_result_kind(self):
         self.assertEqual(MediaResult("video", ["a.mp4"], "T", 5).kind, "video")
         self.assertEqual(MediaResult("photos", ["a.jpg"], "T", 1).paths, ["a.jpg"])
+
+
+class TestYouTubeBlockDetection(unittest.TestCase):
+    """Nhận diện thông báo YouTube chặn IP."""
+
+    def test_block_signals(self):
+        self.assertTrue(_is_youtube_blocked(
+            "ERROR: [youtube] xxx: Failed to extract any player response"
+        ))
+        self.assertTrue(_is_youtube_blocked(
+            "Sign in to confirm you're not a bot"
+        ))
+        self.assertTrue(_is_youtube_blocked(
+            "The page needs to be reloaded"
+        ))
+        # Lỗi download 403 KHÔNG phải block extraction → vẫn nên thử attempt 2
+        self.assertFalse(_is_youtube_blocked(
+            "ERROR: unable to download video data: HTTP Error 403: Forbidden"
+        ))
+        self.assertFalse(_is_youtube_blocked(""))
 
 
 class TestYtdlpOptsAttempts(unittest.TestCase):

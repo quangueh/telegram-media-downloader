@@ -378,6 +378,23 @@ def _clean_error(e: BaseException) -> str:
     return msg
 
 
+# Dấu hiệu IP máy chủ bị YouTube chặn (không phải lỗi tạm thời của từng client)
+_YOUTUBE_BLOCK_SIGNALS = (
+    "failed to extract any player response",
+    "sign in to confirm you're not a bot",
+    "unable to extract initial data",
+    "incomplete data received from youtube",
+    "reload the page",
+    "the page needs to be reloaded",
+)
+
+
+def _is_youtube_blocked(msg: str) -> bool:
+    """Nhận diện thông báo YouTube chặn IP (player response / bot-check)."""
+    low = msg.lower()
+    return any(s in low for s in _YOUTUBE_BLOCK_SIGNALS)
+
+
 def _build_ytdlp_opts(
     url: str,
     target_dir: Path,
@@ -433,8 +450,15 @@ def _build_ytdlp_opts(
             "best[ext=mp4]/best"
         )
         if attempt == 0:
-            opts["extractor_args"] = {"youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS}}
+            opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": YOUTUBE_PLAYER_CLIENTS,
+                    "player_skip": ["js"],
+                }
+            }
         else:
+            # attempt 2: client mặc định của yt-dlp — set rộng nhất, có client
+            # bypass được chặn dữ liệu (đã kiểm chứng tải thành công)
             logger.info("YouTube: dùng player clients mặc định của yt-dlp (attempt 2)")
 
     # Optional: YouTube cookies (Netscape format từ YOUTUBE_COOKIES env var)
@@ -557,13 +581,23 @@ def _sync_ytdlp_download(
                 logger.info(f"yt-dlp tải thành công: {final_file} ({actual_size / (1024*1024):.1f}MB)")
                 return final_file, title, duration
         except yt_dlp.utils.DownloadError as e:
+            msg = _clean_error(e)
             if attempt == 0 and _is_youtube_url(url):
+                # IP bị YouTube chặn thật (player response) + chưa có cookies
+                # → fail nhanh kèm hướng dẫn, không grind client vô ích 150s
+                cookies_set = bool(os.getenv("YOUTUBE_COOKIES", "").strip())
+                if _is_youtube_blocked(msg) and not cookies_set:
+                    raise VideoDownloadError(
+                        "YouTube chặn IP máy chủ (không lấy được player response).\n"
+                        "Hãy cấu hình YOUTUBE_COOKIES (cookie Netscape format từ trình "
+                        "duyệt đã đăng nhập YouTube) trong biến môi trường để tải được."
+                    ) from e
                 _cleanup_leftovers(target_dir, unique_id)
                 logger.warning(
-                    f"yt-dlp attempt 1 fail ({_clean_error(e)[:120]}) — thử client mặc định..."
+                    f"yt-dlp attempt 1 fail ({msg[:120]}) — thử client mặc định..."
                 )
                 continue
-            raise VideoDownloadError(_clean_error(e)) from e
+            raise VideoDownloadError(msg) from e
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -869,7 +903,7 @@ async def _download_via_tikwm(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Thời gian tối đa cho 1 lần chạy yt-dlp (tránh treo vô hạn khi IP bị chặn)
-YTDLP_TIMEOUT = 180
+YTDLP_TIMEOUT = 150
 
 
 async def _run_executor(
@@ -986,9 +1020,10 @@ async def extract_and_download(
             logger.warning(f"Piped API fail: {e}")
 
         hint = (
-            "\n\n💡 <i>Nếu gặp 'Failed to extract any player response' / 'Sign in to confirm"
-            " you're not a bot', hãy cấu hình <code>YOUTUBE_COOKIES</code> (Netscape format)"
-            " để tăng khả năng tải YouTube từ IP máy chủ.</i>"
+            "\n\n💡 <b>IP máy chủ đang bị YouTube chặn.</b> Cách khắc phục:\n"
+            "1️⃣ Đặt <code>YOUTUBE_COOKIES</code> (cookie Netscape format từ trình duyệt "
+            "đã đăng nhập YouTube) vào biến môi trường — hiệu quả nhất.\n"
+            "2️⃣ Chạy PO-token server (<code>bgutil-ytdlp-pot-provider</code>) cạnh bot."
         )
         raise VideoDownloadError(
             "YouTube: tất cả backend đều thất bại.\n"
