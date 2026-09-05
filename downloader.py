@@ -20,6 +20,7 @@ import uuid
 import asyncio
 import tempfile
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Tuple, Optional, Union
 
@@ -82,6 +83,15 @@ class VideoTooLargeError(DownloaderError):
 class VideoDownloadError(DownloaderError):
     """Lỗi khi không thể tải hoặc xử lý video."""
     pass
+
+
+@dataclass
+class MediaResult:
+    """Kết quả tải media từ một link — hỗ trợ cả video và album ảnh (TikTok photo)."""
+    kind: str                       # "video" | "photos"
+    paths: list                     # video: [path]; photos: [path1, path2, ...]
+    title: str = "Media"
+    duration: int = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -728,12 +738,8 @@ async def _download_stream_with_retry(
     return 0
 
 
-async def _download_via_tikwm(
-    url: str,
-    output_dir: Path,
-    progress_cb: ProgressCB = None,
-) -> Optional[Tuple[str, str, int]]:
-    """Tải TikTok video không watermark qua tikwm API."""
+async def _fetch_tikwm_info(url: str) -> Optional[dict]:
+    """Resolve link rút gọn + gọi tikwm API, trả về dict data, hoặc None nếu lỗi."""
     match = TIKTOK_URL_PATTERN.search(url)
     if not match:
         return None
@@ -761,24 +767,63 @@ async def _download_via_tikwm(
     if data.get("code") != 0 or not data.get("data"):
         logger.warning(f"TikTok tikwm API lỗi: {data.get('msg')}")
         return None
+    return data["data"]
 
-    info = data["data"]
-    # Ưu tiên stream `play` (H.264, phát được mọi thiết bị) — `hdplay` thường là
-    # HEVC, phải re-encode chậm. Chỉ dùng hdplay nếu không có play.
-    video_url = info.get("play") or info.get("hdplay")
-    if not video_url:
+
+async def _download_via_tikwm(
+    url: str,
+    output_dir: Path,
+    progress_cb: ProgressCB = None,
+) -> Optional[MediaResult]:
+    """Tải TikTok qua tikwm API — hỗ trợ cả video lẫn bài đăng ảnh (photo post)."""
+    info = await _fetch_tikwm_info(url)
+    if not info:
         return None
 
     title = (info.get("title") or "Video TikTok").strip() or "Video TikTok"
+
+    target_dir = output_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    unique_id = uuid.uuid4().hex[:10]
+
+    # ── TikTok PHOTO POST: tikwm trả danh sách ảnh (`images`), còn `play` chỉ là
+    #    nhạc nền (MP3) → tải các ảnh và gửi dạng album, KHÔNG xử lý như video.
+    images = info.get("images") or []
+    if images:
+        paths: list = []
+        try:
+            for i, img_url in enumerate(images, 1):
+                img_path = target_dir / f"{unique_id}_{i:02d}.jpg"
+                await _http_download_stream(
+                    img_url, img_path, timeout=40,
+                    label=f"🖼️ Tải ảnh {i}/{len(images)}",
+                )
+                paths.append(str(img_path))
+        except Exception as e:
+            for p in paths:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            _cleanup_leftovers(target_dir, unique_id)
+            logger.warning(f"Tải ảnh TikTok photo fail: {e}")
+            return None
+        logger.info(f"TikTok photo post: {len(paths)} ảnh")
+        return MediaResult("photos", paths, title=title, duration=len(paths))
+
+    # ── TikTok VIDEO ──
     duration = int(info.get("duration") or 0)
 
     estimated_size = info.get("size") or 0
     if isinstance(estimated_size, (int, float)) and estimated_size > MAX_FILE_SIZE:
         raise VideoTooLargeError(int(estimated_size), MAX_FILE_SIZE)
 
-    target_dir = output_dir
-    target_dir.mkdir(parents=True, exist_ok=True)
-    unique_id = uuid.uuid4().hex[:10]
+    # Ưu tiên stream `play` (H.264, phát được mọi thiết bị) — `hdplay` thường là
+    # HEVC, phải re-encode chậm. Chỉ dùng hdplay nếu không có play.
+    video_url = info.get("play") or info.get("hdplay")
+    if not video_url:
+        return None
+
     safe_title = _safe_filename(title, unique_id)
     file_path = target_dir / f"{safe_title}_{unique_id}.mp4"
 
@@ -796,7 +841,7 @@ async def _download_via_tikwm(
 
     logger.info(f"TikTok tikwm tải thành công: {file_path}")
     file_path = _ensure_playable(str(file_path), progress_cb=progress_cb)
-    return str(file_path), title, duration
+    return MediaResult("video", [str(file_path)], title=title, duration=duration)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -807,12 +852,12 @@ async def extract_and_download(
     url: str,
     output_path: Optional[Union[str, Path]] = None,
     progress_cb: ProgressCB = None,
-) -> Tuple[str, str, int]:
+) -> MediaResult:
     """
-    Router tải video đa nền tảng.
+    Router tải media đa nền tảng — trả về MediaResult (video hoặc album ảnh).
 
     - YouTube: yt-dlp → Piped API → VideoDownloadError
-    - TikTok: yt-dlp → tikwm API → VideoDownloadError
+    - TikTok (video/photo): tikwm API → yt-dlp → VideoDownloadError
     - Khác: yt-dlp → VideoDownloadError
 
     progress_cb: callable(pct_or_None, text) — thread-safe, tùy chọn.
@@ -830,6 +875,10 @@ async def extract_and_download(
         except Exception:
             pass
 
+    def _as_result(result: Tuple[str, str, int]) -> MediaResult:
+        path, title, duration = result
+        return MediaResult("video", [path], title=title, duration=duration)
+
     # ── YouTube routing ──
     if _is_youtube_url(url):
         errors = []
@@ -840,7 +889,7 @@ async def extract_and_download(
                 None, _sync_ytdlp_download, url, target_dir, _cb
             )
             if result:
-                return result
+                return _as_result(result)
         except (VideoTooLargeError, VideoDownloadError) as e:
             errors.append(f"yt-dlp: {_clean_error(e)}")
             if isinstance(e, VideoTooLargeError):
@@ -855,7 +904,7 @@ async def extract_and_download(
             result = await _download_via_piped(url, target_dir, _cb)
             if result:
                 logger.info("YouTube tải thành công qua Piped API")
-                return result
+                return _as_result(result)
         except VideoTooLargeError:
             raise
         except Exception as e:
@@ -890,7 +939,7 @@ async def extract_and_download(
                 None, _sync_ytdlp_download, url, target_dir, _cb
             )
             if result:
-                return result
+                return _as_result(result)
         except (VideoTooLargeError, VideoDownloadError) as e:
             errors.append(f"yt-dlp: {_clean_error(e)}")
             if isinstance(e, VideoTooLargeError):
@@ -910,7 +959,7 @@ async def extract_and_download(
         None, _sync_ytdlp_download, url, target_dir, _cb
     )
     if result:
-        return result
+        return _as_result(result)
     raise VideoDownloadError("Không thể tải video từ liên kết này.")
 
 

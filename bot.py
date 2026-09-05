@@ -9,7 +9,7 @@ import uuid
 from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from telegram import Update
+from telegram import InputMediaPhoto, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -728,7 +728,7 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     url = match.group(0)
     chat_id = update.effective_chat.id
     progress = None
-    downloaded_file = None
+    downloaded_files: list = []
 
     # Xác định nền tảng
     user = update.effective_user
@@ -745,7 +745,7 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # Gửi tin nhắn tiến trình — tự cập nhật % trong lúc tải
         progress = TelegramProgress(
             context, chat_id,
-            initial_text="⏳ <b>Đang tải và xử lý video...</b>",
+            initial_text="⏳ <b>Đang tải và xử lý media...</b>",
             title=f"🎬 {platform}",
         )
         # Đợi message được tạo (create_task trong __init__)
@@ -758,34 +758,66 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         def _dl_progress(pct, text):
             progress.update_sync(pct, text)
 
-        file_path, title, duration = await extract_and_download(url, progress_cb=_dl_progress)
-        downloaded_file = file_path
+        result = await extract_and_download(url, progress_cb=_dl_progress)
+        downloaded_files = result.paths
+        title = result.title
+        duration = result.duration
 
         # Chuẩn bị caption an toàn (giới hạn ký tự tối đa của Telegram là 1024)
         safe_title = html.escape(title)
         if len(safe_title) > 900:
             safe_title = safe_title[:900] + "..."
-
         caption = f"🎬 <b>{safe_title}</b>"
 
-        # Cập nhật trạng thái đang upload
-        try:
-            await progress.finish("🚀 <b>Đang tải video lên Telegram...</b>")
-        except Exception:
-            pass
+        # ── TikTok PHOTO POST: gửi album ảnh ──
+        if result.kind == "photos":
+            try:
+                await progress.finish("🖼️ <b>Đang tải ảnh lên Telegram...</b>")
+            except Exception:
+                pass
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
 
-        # Gửi video về cho người dùng
-        with open(downloaded_file, "rb") as video_file:
-            await context.bot.send_video(
-                chat_id=chat_id,
-                video=video_file,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                duration=duration if duration > 0 else None,
-                supports_streaming=True,
-                read_timeout=REQUEST_TIMEOUT,
-                write_timeout=REQUEST_TIMEOUT,
-            )
+            # Media group tối đa 10 ảnh/group → chia batch
+            handles = []
+            try:
+                batch = []
+                for idx, path in enumerate(result.paths):
+                    fh = open(path, "rb")
+                    handles.append(fh)
+                    if idx == 0:
+                        batch.append(InputMediaPhoto(fh, caption=caption, parse_mode=ParseMode.HTML))
+                    else:
+                        batch.append(InputMediaPhoto(fh))
+                    if len(batch) == 10:
+                        await context.bot.send_media_group(chat_id=chat_id, media=batch)
+                        batch = []
+                if batch:
+                    await context.bot.send_media_group(chat_id=chat_id, media=batch)
+            finally:
+                for fh in handles:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+        else:
+            # ── VIDEO: gửi video như bình thường ──
+            # Cập nhật trạng thái đang upload
+            try:
+                await progress.finish("🚀 <b>Đang tải video lên Telegram...</b>")
+            except Exception:
+                pass
+
+            with open(downloaded_files[0], "rb") as video_file:
+                await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=video_file,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    duration=duration if duration > 0 else None,
+                    supports_streaming=True,
+                    read_timeout=REQUEST_TIMEOUT,
+                    write_timeout=REQUEST_TIMEOUT,
+                )
 
         # Xóa tin nhắn trạng thái sau khi gửi thành công
         try:
@@ -854,13 +886,14 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await update.message.reply_text(error_text)
 
     finally:
-        # Tự động dọn dẹp file video tạm thời để tránh tràn dung lượng ổ đĩa
-        if downloaded_file and os.path.exists(downloaded_file):
-            try:
-                os.remove(downloaded_file)
-                logger.info(f"Đã dọn dẹp file tạm thành công: {downloaded_file}")
-            except OSError as cleanup_err:
-                logger.warning(f"Không thể xóa file tạm {downloaded_file}: {cleanup_err}")
+        # Tự động dọn dẹp file tạm thời để tránh tràn dung lượng ổ đĩa
+        for tmp_file in downloaded_files:
+            if tmp_file and os.path.exists(tmp_file):
+                try:
+                    os.remove(tmp_file)
+                    logger.info(f"Đã dọn dẹp file tạm thành công: {tmp_file}")
+                except OSError as cleanup_err:
+                    logger.warning(f"Không thể xóa file tạm {tmp_file}: {cleanup_err}")
 
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

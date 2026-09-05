@@ -1,5 +1,6 @@
 import os
 import sys
+import asyncio
 import shutil
 import subprocess
 import unittest
@@ -18,6 +19,7 @@ from downloader import (
     VideoDownloadError,
     DownloaderError,
     IncompleteDownloadError,
+    MediaResult,
     _sync_extract_and_download,
     _ensure_playable,
     _probe_stream_codec,
@@ -28,6 +30,14 @@ from downloader import (
 )
 
 FFMPEG_AVAILABLE = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
+
+def asyncio_run(coro):
+    """Chạy coroutine trong event loop (đã có running loop → trả thẳng)."""
+    try:
+        return asyncio.get_running_loop().run_until_complete(coro)
+    except RuntimeError:
+        return asyncio.run(coro)
 
 
 def _ffmpeg(args):
@@ -204,6 +214,60 @@ class TestDownloaderRouting(unittest.TestCase):
                     _sync_extract_and_download(
                         "https://example.com/x", DOWNLOAD_DIR
                     )
+
+
+class TestTikTokPhotoPost(unittest.TestCase):
+    """TikTok bài đăng ảnh phải tải ảnh (kind='photos') thay vì xử lý như video."""
+
+    def _fake_download(self, dest):
+        return dest
+
+    async def _run(self, images):
+        import asyncio
+        from downloader import _download_via_tikwm
+
+        async def fake_stream(url, dest, **kwargs):
+            Path(dest).write_bytes(b"fake-image")
+            return len(b"fake-image")
+
+        info = {
+            "title": "Photo album test",
+            "images": images,
+            "play": "https://example.com/music.mp3",
+            "duration": 0,
+            "size": 0,
+        }
+        with mock.patch("downloader._fetch_tikwm_info", new=mock.AsyncMock(return_value=info)):
+            with mock.patch("downloader._http_download_stream", new=mock.AsyncMock(side_effect=fake_stream)):
+                return await _download_via_tikwm(
+                    "https://www.tiktok.com/@user/photo/123456",
+                    DOWNLOAD_DIR,
+                )
+
+    def test_photo_post_single(self):
+        result = asyncio_run(self._run(["https://example.com/1.jpg"]))
+        self.assertIsNotNone(result)
+        self.assertEqual(result.kind, "photos")
+        self.assertEqual(len(result.paths), 1)
+        self.assertEqual(result.title, "Photo album test")
+        self.assertTrue(Path(result.paths[0]).exists())
+
+    def test_photo_post_multiple(self):
+        result = asyncio_run(self._run([
+            "https://example.com/1.jpg",
+            "https://example.com/2.jpg",
+            "https://example.com/3.jpg",
+        ]))
+        self.assertIsNotNone(result)
+        self.assertEqual(result.kind, "photos")
+        self.assertEqual(len(result.paths), 3)
+        self.assertEqual(result.duration, 3)
+        for p in result.paths:
+            self.assertTrue(Path(p).exists())
+
+    def test_media_result_kind(self):
+        self.assertEqual(MediaResult("video", ["a.mp4"], "T", 5).kind, "video")
+        self.assertEqual(MediaResult("photos", ["a.jpg"], "T", 1).paths, ["a.jpg"])
 
 
 if __name__ == "__main__":
