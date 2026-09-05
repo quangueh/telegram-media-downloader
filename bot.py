@@ -2,6 +2,7 @@ import os
 import re
 import html
 import asyncio
+import random
 import threading
 import time
 import uuid
@@ -328,7 +329,12 @@ async def _process_gif(reply_msg, context: ContextTypes.DEFAULT_TYPE) -> None:
             title="🎞️ GIF Maker",
         )
         await progress._create_task
-        tg_file = await context.bot.get_file(reply_msg.video.file_id)
+        video = reply_msg.video
+        if video is None and reply_msg.document and "video" in (reply_msg.document.mime_type or ""):
+            video = reply_msg.document
+        if video is None:
+            raise ValueError("Không tìm thấy video để chuyển thành GIF")
+        tg_file = await context.bot.get_file(video.file_id)
         unique_id = uuid.uuid4().hex[:8]
         video_path = str(DOWNLOAD_DIR / f"gif_in_{unique_id}.mp4")
         await tg_file.download_to_drive(video_path)
