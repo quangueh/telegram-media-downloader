@@ -857,6 +857,30 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         pass
 
 
+# Render gán URL public qua biến RENDER_EXTERNAL_URL
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+# Interval self-ping: 4 phút (Render spin-down sau 15 phút không traffic)
+KEEPALIVE_INTERVAL = 240
+
+
+def _keepalive_loop() -> None:
+    """Self-ping URL public của Render để tránh free tier spin-down."""
+    import urllib.request
+
+    while True:
+        time.sleep(KEEPALIVE_INTERVAL)
+        if not RENDER_EXTERNAL_URL:
+            continue
+        try:
+            req = urllib.request.Request(
+                RENDER_EXTERNAL_URL, headers={"User-Agent": "keepalive"}
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                logger.info(f"Keep-alive ping OK ({resp.status})")
+        except Exception as e:
+            logger.warning(f"Keep-alive ping thất bại: {e}")
+
+
 def start_health_check_server(port: int) -> None:
     """Khởi chạy HTTP server phụ trợ trong luồng riêng để đáp ứng Render Port check."""
     try:
@@ -864,6 +888,14 @@ def start_health_check_server(port: int) -> None:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         logger.info(f"Đã kích hoạt Health-Check HTTP server trên cổng {port} (Render compatible)")
+
+        # Keep-alive: tự ping chính mình mỗi 4 phút để không bị spin-down
+        if RENDER_EXTERNAL_URL:
+            ka_thread = threading.Thread(target=_keepalive_loop, daemon=True)
+            ka_thread.start()
+            logger.info(f"Keep-alive đã bật — ping {RENDER_EXTERNAL_URL} mỗi {KEEPALIVE_INTERVAL}s")
+        else:
+            logger.info("Keep-alive tắt — chưa có RENDER_EXTERNAL_URL")
     except Exception as e:
         logger.warning(f"Không thể khởi chạy Health-check server trên cổng {port}: {e}")
 
@@ -928,8 +960,9 @@ def main() -> None:
     application.add_error_handler(global_error_handler)
 
     logger.info("Bot đã sẵn sàng và đang lắng nghe tin nhắn...")
-    # Chạy polling với cấu hình an toàn
-    application.run_polling(drop_pending_updates=True)
+    # Polling — KHÔNG drop pending updates: tin nhắn gửi lúc bot restart
+    # (deploy mới / wake từ sleep) vẫn được xử lý thay vì bị vứt bỏ
+    application.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
