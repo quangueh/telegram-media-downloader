@@ -124,6 +124,97 @@ def _cleanup_leftovers(directory: Path, unique_id: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  COMPATIBILITY — đảm bảo file phát được trên mọi thiết bị
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Container MP4 hợp lệ (theo ffprobe format_name)
+_MP4_CONTAINERS = ("mov", "mp4", "m4a", "3gp", "3g2", "mj2")
+
+
+def _probe_stream_codec(file_path: str, stream: str) -> str:
+    """Trả về codec của stream (v:0 hoặc a:0), '' nếu stream không tồn tại."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", stream,
+             "-show_entries", "stream=codec_name", "-of", "csv=p=0", file_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _probe_container(file_path: str) -> str:
+    """Trả về tên container (format_name) theo ffprobe."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=format_name",
+             "-of", "csv=p=0", file_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _is_mp4_container(container: str) -> bool:
+    """Kiểm tra container có phải họ MP4 không (format_name có thể là list phân tách phẩy)."""
+    if not container:
+        return False
+    tokens = [t.strip().lower() for t in container.split(",") if t.strip()]
+    return any(t in _MP4_CONTAINERS for t in tokens)
+
+
+def _ensure_playable(file_path: str) -> str:
+    """
+    Đảm bảo file là H.264 + AAC trong MP4 (moov atom ở đầu) — phát được trên mọi
+    điện thoại / PC / Telegram. Nếu codec không tương thích (VP9/AV1/HEVC...) thì
+    re-encode bằng FFmpeg sang H.264. Trả về đường dẫn file cuối.
+    """
+    vcodec = _probe_stream_codec(file_path, "v:0")
+    acodec = _probe_stream_codec(file_path, "a:0")
+    container = _probe_container(file_path)
+
+    if (
+        vcodec in ("h264", "avc1")
+        and (not acodec or acodec in ("aac", "mp3"))
+        and _is_mp4_container(container)
+    ):
+        return file_path
+
+    logger.info(
+        f"File không tương thích (vcodec={vcodec or '-'}, acodec={acodec or '-'}, "
+        f"container={container or '-'}) — đang chuyển sang H.264 + AAC..."
+    )
+    tmp_path = file_path + ".playable.mp4"
+    cmd = ["ffmpeg", "-y", "-i", file_path]
+    if vcodec in ("h264", "avc1"):
+        cmd += ["-c:v", "copy"]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+    if acodec and acodec not in ("aac", "mp3"):
+        cmd += ["-c:a", "aac", "-b:a", "128k"]
+    cmd += ["-movflags", "+faststart", "-f", "mp4", "-loglevel", "error", tmp_path]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=900)
+        if result.returncode == 0 and os.path.exists(tmp_path):
+            os.replace(tmp_path, file_path)
+            return file_path
+        logger.warning(
+            f"Re-encode thất bại: {result.stderr.decode('utf-8', errors='replace')[-300:]}"
+        )
+    except Exception as e:
+        logger.warning(f"Re-encode lỗi: {e}")
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    return file_path
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  SHARED: HTTP STREAM DOWNLOAD
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -198,14 +289,22 @@ def _build_ytdlp_opts(
     """Xây dựng ydl_opts cho yt-dlp, tối ưu theo nền tảng."""
     outtmpl = str(target_dir / f"{_safe_filename('%(title)s', unique_id)}_{unique_id}.%(ext)s")
 
+    # Ưu tiên H.264 + AAC trong mp4 — tương thích mọi thiết bị / Telegram.
+    # Tránh các format "enhanced" mới của YouTube (VP9/AV1/HEVC nhét trong mp4,
+    # VD: format 395/616...) vì gây màn trắng trên điện thoại / unsupported trên PC.
     opts = {
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "format": (
+            "best[ext=mp4][vcodec^=avc1][acodec^=mp4a]/"
+            "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
+            "best[ext=mp4]/best"
+        ),
         "merge_output_format": "mp4",
         "outtmpl": outtmpl,
         "max_filesize": MAX_FILE_SIZE,
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "postprocessor_args": ["-movflags", "+faststart"],
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -216,12 +315,14 @@ def _build_ytdlp_opts(
         },
     }
 
-    # YouTube: player clients không cần PO token + format <45MB
+    # YouTube: player clients không cần PO token + format H.264 <45MB
     if _is_youtube_url(url):
         opts["extractor_args"] = {"youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS}}
         opts["format"] = (
-            "best[ext=mp4][filesize_approx<45M]/"
-            "bestvideo[ext=mp4][filesize_approx<45M]+bestaudio[ext=m4a]/"
+            "best[ext=mp4][vcodec^=avc1][acodec^=mp4a][filesize_approx<45M]/"
+            "bestvideo[ext=mp4][vcodec^=avc1][filesize_approx<45M]+bestaudio[ext=m4a]/"
+            "best[ext=mp4][vcodec^=avc1][acodec^=mp4a]/"
+            "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/"
             "best[ext=mp4]/best"
         )
 
@@ -321,6 +422,16 @@ def _sync_ytdlp_download(
                 else:
                     raise VideoDownloadError("Không tìm thấy tệp video sau khi tải xuống.")
 
+        actual_size = os.path.getsize(final_file)
+        if actual_size > MAX_FILE_SIZE:
+            try:
+                os.remove(final_file)
+            except OSError:
+                pass
+            raise VideoTooLargeError(actual_size, MAX_FILE_SIZE)
+
+        # Đảm bảo codec H.264 + AAC trong mp4 — tránh màn trắng / unsupported
+        final_file = _ensure_playable(final_file)
         actual_size = os.path.getsize(final_file)
         if actual_size > MAX_FILE_SIZE:
             try:
@@ -471,6 +582,7 @@ async def _download_via_piped(
 
         # Kiểm tra kích thước cuối
         if os.path.exists(final_path):
+            final_path = _ensure_playable(final_path)
             actual_size = os.path.getsize(final_path)
             if actual_size > MAX_FILE_SIZE:
                 try:
@@ -552,6 +664,7 @@ async def _download_via_tikwm(
         return None
 
     logger.info(f"TikTok tikwm tải thành công: {file_path}")
+    file_path = _ensure_playable(str(file_path))
     return str(file_path), title, duration
 
 
