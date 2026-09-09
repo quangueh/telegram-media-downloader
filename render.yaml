@@ -23,6 +23,10 @@ services:
       # Leave empty: bot uses visionos/android_vr/tv clients instead.
       - key: YOUTUBE_COOKIES
         value: ""
+      # TikTok/Douyin cookies (optional): Netscape-format cookies.txt từ trình duyệt
+      # đã đăng nhập TikTok — tăng độ thành công khi tải TikTok/Douyin từ IP máy chủ.
+      - key: TIKTOK_COOKIES
+        value: ""
       # Admin Telegram user ID — chỉ user này mới dùng được /admin
       - key: ADMIN_USER_ID
         value: ""

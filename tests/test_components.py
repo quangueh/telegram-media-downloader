@@ -28,6 +28,9 @@ from downloader import (
     _safe_filename,
     _fmt_mb,
     _is_youtube_blocked,
+    _is_douyin_url,
+    _is_tiktok_url,
+    _load_cookies,
 )
 
 FFMPEG_AVAILABLE = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
@@ -271,6 +274,44 @@ class TestTikTokPhotoPost(unittest.TestCase):
         self.assertEqual(MediaResult("photos", ["a.jpg"], "T", 1).paths, ["a.jpg"])
 
 
+class TestPlatformDetection(unittest.TestCase):
+    """Nhận diện link theo nền tảng (TikTok / Douyin / YouTube)."""
+
+    def test_tiktok_urls(self):
+        for u in [
+            "https://vt.tiktok.com/ZSqLpEjoM/",
+            "https://vm.tiktok.com/abc/",
+            "https://www.tiktok.com/@user/video/123456",
+            "https://www.tiktok.com/@user/photo/123456",
+        ]:
+            self.assertTrue(_is_tiktok_url(u), u)
+
+    def test_douyin_urls(self):
+        for u in [
+            "https://v.douyin.com/iYRAPA2L/",
+            "https://www.douyin.com/video/7624728488368732900",
+            "https://www.iesdouyin.com/share/video/7624728488368732900/",
+        ]:
+            self.assertTrue(_is_douyin_url(u), u)
+        self.assertFalse(_is_douyin_url("https://www.tiktok.com/@u/video/1"))
+
+    def test_load_cookies_sets_cookiefile(self):
+        import tempfile as _tf
+        opts = {}
+        with mock.patch.dict(os.environ, {"TIKTOK_COOKIES": "# Netscape\nx.com\tTRUE\t/"},
+                             clear=False):
+            _load_cookies(opts, "TIKTOK_COOKIES", "TikTok")
+        self.assertIn("cookiefile", opts)
+        self.assertTrue(Path(opts["cookiefile"]).exists())
+
+    def test_load_cookies_empty(self):
+        opts = {}
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("YOUTUBE_COOKIES", None)
+            _load_cookies(opts, "YOUTUBE_COOKIES", "YouTube")
+        self.assertNotIn("cookiefile", opts)
+
+
 class TestYouTubeBlockDetection(unittest.TestCase):
     """Nhận diện thông báo YouTube chặn IP."""
 
@@ -300,10 +341,11 @@ class TestYtdlpOptsAttempts(unittest.TestCase):
         base = "https://www.youtube.com/watch?v=abc123xyz99"
         opts0 = _build_ytdlp_opts(base, Path(tempfile.gettempdir()), "uid", attempt=0)
         opts1 = _build_ytdlp_opts(base, Path(tempfile.gettempdir()), "uid", attempt=1)
-        # attempt 0: extractor_args player_client
+        # attempt 0: danh sách player_client giới hạn (tránh PO token)
         self.assertIn("player_client", opts0["extractor_args"]["youtube"])
-        # attempt 1: không giới hạn client (dùng mặc định)
-        self.assertNotIn("extractor_args", opts1)
+        self.assertIsInstance(opts0["extractor_args"]["youtube"]["player_client"], list)
+        # attempt 1: fallback default,-web (kỹ thuật VidBee cho IP datacenter)
+        self.assertEqual(opts1["extractor_args"]["youtube"]["player_client"], "default,-web")
         # cả 2 vẫn ưu tiên H.264 + AAC
         self.assertIn("vcodec^=avc1", opts0["format"])
         self.assertIn("vcodec^=avc1", opts1["format"])

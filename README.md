@@ -6,9 +6,10 @@ Bot Telegram chuyên dụng tải video chất lượng cao, **không dính wate
 
 ## 🌟 Tính Năng Nổi Bật
 
-- 🎵 **TikTok No-Watermark:** Tự động phát hiện và trích xuất luồng video gốc không logo / watermark từ TikTok.
+- 🎵 **TikTok No-Watermark:** Tự động phát hiện và trích xuất luồng video gốc không logo / watermark từ TikTok (kể cả bài đăng ảnh → gửi album ảnh).
+- 🇨🇳 **Douyin:** Hỗ trợ link Douyin (v.douyin.com / www.douyin.com) qua yt-dlp.
 - 📘 **Facebook HD:** Tải video Facebook với độ phân giải cao nhất (SD/HD).
-- 📺 **YouTube Full Audio & Video:** Tự động hợp nhất video và audio chất lượng cao nhất bằng FFmpeg sang định dạng MP4 chuẩn.
+- 📺 **YouTube Full Audio & Video:** Tự động hợp nhất video và audio chất lượng cao nhất bằng FFmpeg sang định dạng MP4 chuẩn (H.264 + AAC, phát được mọi thiết bị).
 - ⚡ **Xử lý Bất đồng bộ (Async/Await):** Không block bot event loop khi xử lý nhiều người dùng cùng lúc (`asyncio.to_thread`).
 - 🛡️ **Kiểm soát dung lượng an toàn (Telegram 50MB Limit):** Bắt và xử lý lỗi tệp vượt quá 50MB rõ ràng, không gây crash bot.
 - 🧹 **Tự động dọn dẹp (Storage Cleanup):** Khối `finally` đảm bảo xóa file tạm thời trên ổ cứng ngay sau khi gửi hoặc khi phát sinh lỗi.
@@ -86,15 +87,23 @@ telegram-media-downloader/
    cp .env.example .env
    ```
    Mở file `.env` và điền token của bạn:
-   ```env
-   BOT_TOKEN=your_actual_bot_token_here
-   LOG_LEVEL=INFO
-   ```
+```env
+    BOT_TOKEN=your_actual_bot_token_here
+    LOG_LEVEL=INFO
+    ```
 
-5. **Khởi chạy bot:**
-   ```bash
-   python bot.py
-   ```
+5. *(Tùy chọn — quan trọng khi chạy trên server/IP datacenter)* Thêm cookies để tải
+   YouTube / TikTok / Douyin không bị chặn. Dùng extension **"Get cookies.txt LOCALLY"**
+   xuất cookies (Netscape format) từ trình duyệt đã đăng nhập, rồi dán vào biến môi trường:
+    ```env
+    YOUTUBE_COOKIES=<nội dung cookies.txt của YouTube>
+    TIKTOK_COOKIES=<nội dung cookies.txt của TikTok>
+    ```
+
+6. **Khởi chạy bot:**
+    ```bash
+    python bot.py
+    ```
 
 ---
 

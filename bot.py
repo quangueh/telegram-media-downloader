@@ -734,6 +734,8 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user = update.effective_user
     if "tiktok.com" in url.lower() or "vm.tiktok.com" in url.lower():
         platform = "TikTok"
+    elif "douyin.com" in url.lower() or "iesdouyin.com" in url.lower():
+        platform = "Douyin"
     elif "youtube.com" in url.lower() or "youtu.be" in url.lower():
         platform = "YouTube"
     elif "facebook.com" in url.lower() or "fb.watch" in url.lower():

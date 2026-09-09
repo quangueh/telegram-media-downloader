@@ -37,6 +37,11 @@ from config import MAX_FILE_SIZE, DOWNLOAD_DIR, logger
 TIKTOK_URL_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/[^\s]+", re.IGNORECASE
 )
+# Douyin (TikTok Trung Quốc): v.douyin.com / www.douyin.com / iesdouyin.com
+DOUYIN_URL_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.|v\.|ies\.)?(?:douyin\.com|iesdouyin\.com)/[^\s]+",
+    re.IGNORECASE,
+)
 YOUTUBE_URL_PATTERN = re.compile(
     r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[^\s]+",
     re.IGNORECASE,
@@ -47,6 +52,10 @@ YOUTUBE_ID_PATTERN = re.compile(
 
 # Player client YouTube không yêu cầu PO Token (thứ tự ưu tiên theo test 2026-09-05)
 YOUTUBE_PLAYER_CLIENTS = ["visionos", "android_vr", "android", "tv_embedded", "android_music", "mweb_safari"]
+
+# Attempt 2: bỏ client `web` (bị PO-token chặn hay 403), giữ các client còn lại
+# (kỹ thuật từ VidBee — hoạt động tốt trên IP datacenter)
+YOUTUBE_CLIENTS_FALLBACK = "default,-web"
 
 # Piped API instances (fallback, kiểm tra theo thứ tự — nhiều instance hay chết, thử nhiều)
 PIPED_INSTANCES = [
@@ -107,6 +116,30 @@ class MediaResult:
 def _is_tiktok_url(url: str) -> bool:
     """Kiểm tra liên kết có phải TikTok hay không (hỗ trợ cả liên kết rút gọn)."""
     return bool(TIKTOK_URL_PATTERN.search(url))
+
+
+def _is_douyin_url(url: str) -> bool:
+    """Kiểm tra liên kết có phải Douyin (TikTok Trung Quốc) hay không."""
+    return bool(DOUYIN_URL_PATTERN.search(url))
+
+
+def _load_cookies(opts: dict, env_name: str, label: str) -> None:
+    """Đọc cookies (Netscape string hoặc path file) từ env var vào ydl_opts.
+
+    Giúp tải TikTok/YouTube từ IP datacenter bị chặn:
+    - YOUTUBE_COOKIES  → dùng cho link YouTube
+    - TIKTOK_COOKIES   → dùng cho link TikTok / Douyin
+    """
+    cookies_str = os.getenv(env_name, "").strip()
+    if not cookies_str:
+        return
+    if os.path.isfile(cookies_str):
+        opts["cookiefile"] = cookies_str
+    else:
+        cookie_file = Path(tempfile.gettempdir()) / f"{env_name.lower()}_cookies.txt"
+        cookie_file.write_text(cookies_str, encoding="utf-8")
+        opts["cookiefile"] = str(cookie_file)
+    logger.info(f"{label} cookies loaded từ {env_name} env var.")
 
 
 def _is_youtube_url(url: str) -> bool:
@@ -457,20 +490,18 @@ def _build_ytdlp_opts(
                 }
             }
         else:
-            # attempt 2: client mặc định của yt-dlp — set rộng nhất, có client
-            # bypass được chặn dữ liệu (đã kiểm chứng tải thành công)
-            logger.info("YouTube: dùng player clients mặc định của yt-dlp (attempt 2)")
+            # attempt 2: default,-web — bỏ client `web` (PO-token gated hay 403),
+            # giữ các client khác làm fallback (kỹ thuật VidBee cho IP datacenter)
+            logger.info("YouTube: dùng player clients default,-web (attempt 2)")
+            opts["extractor_args"] = {
+                "youtube": {"player_client": YOUTUBE_CLIENTS_FALLBACK}
+            }
 
-    # Optional: YouTube cookies (Netscape format từ YOUTUBE_COOKIES env var)
-    cookies_str = os.getenv("YOUTUBE_COOKIES", "").strip()
-    if cookies_str:
-        if os.path.isfile(cookies_str):
-            opts["cookiefile"] = cookies_str
-        else:
-            cookie_file = Path(tempfile.gettempdir()) / "yt_cookies.txt"
-            cookie_file.write_text(cookies_str, encoding="utf-8")
-            opts["cookiefile"] = str(cookie_file)
-        logger.info("YouTube cookies loaded từ YOUTUBE_COOKIES env var.")
+    # Cookies theo platform (giúp tải từ IP datacenter bị chặn)
+    if _is_youtube_url(url):
+        _load_cookies(opts, "YOUTUBE_COOKIES", "YouTube")
+    if _is_tiktok_url(url) or _is_douyin_url(url):
+        _load_cookies(opts, "TIKTOK_COOKIES", "TikTok/Douyin")
 
     # Progress hook: report % tải về qua callback (nếu có)
     if progress_cb:
@@ -1074,6 +1105,27 @@ async def extract_and_download(
             "TikTok: tất cả backend đều thất bại.\n"
             + "\n".join(f"• {err}" for err in errors)
         )
+
+    # ── Douyin routing (TikTok Trung Quốc) ──
+    # tikwm không hỗ trợ Douyin → dùng yt-dlp (có extractor douyin).
+    # IP datacenter có thể cần TIKTOK_COOKIES hoặc signature mới tải được.
+    if _is_douyin_url(url):
+        try:
+            result = await _run_executor(
+                loop, _sync_ytdlp_download, (url, target_dir, _cb),
+                progress_cb=_cb,
+                start_text="⏳ Đang lấy thông tin video Douyin (yt-dlp)...",
+                heartbeat_text="⏳ Vẫn đang xử lý Douyin, xin chờ...",
+            )
+            if result:
+                return _as_result(result)
+        except asyncio.TimeoutError:
+            raise VideoDownloadError("Douyin: quá thời gian xử lý (IP bị chặn hoặc quá chậm).")
+        except VideoTooLargeError:
+            raise
+        except Exception as e:
+            raise VideoDownloadError(f"Douyin: {_clean_error(e)}") from e
+        raise VideoDownloadError("Douyin: không tải được liên kết này.")
 
     # ── Facebook / nền tảng khác: yt-dlp mặc định ──
     try:
