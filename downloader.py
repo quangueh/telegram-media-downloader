@@ -740,10 +740,11 @@ async def _download_via_piped(
                     await asyncio.sleep(0)
                     return (final_path, title, duration)
 
-                # FFmpeg merge
+                # FFmpeg merge — chạy trong thread tránh block event loop
                 final_path = str(target_dir / f"{safe_title}_{unique_id}.mp4")
                 try:
-                    result = subprocess.run(
+                    result = await asyncio.to_thread(
+                        subprocess.run,
                         ["ffmpeg", "-y", "-i", str(video_path), "-i", str(audio_path),
                          "-c", "copy", final_path],
                         capture_output=True, timeout=300,
@@ -770,7 +771,7 @@ async def _download_via_piped(
 
         # Kiểm tra kích thước cuối
         if os.path.exists(final_path):
-            final_path = _ensure_playable(final_path, progress_cb=progress_cb)
+            final_path = await asyncio.to_thread(_ensure_playable, final_path, progress_cb)
             actual_size = os.path.getsize(final_path)
             if actual_size > MAX_FILE_SIZE:
                 try:
@@ -948,7 +949,7 @@ async def _download_via_tikwm(
                 await _http_download_stream(
                     media_url, media_file, timeout=40, label="⏳ Kiểm tra media...",
                 )
-                vcodec = _probe_stream_codec(str(media_file), "v:0")
+                vcodec = await asyncio.to_thread(_probe_stream_codec, str(media_file), "v:0")
                 if vcodec:
                     # Dạng A: video slideshow sẵn có → gửi video gốc
                     final = str(target_dir / f"{unique_id}.mp4")
@@ -956,7 +957,7 @@ async def _download_via_tikwm(
                         os.replace(media_file, final)
                     except OSError:
                         final = str(media_file)
-                    final = _ensure_playable(final, progress_cb=progress_cb)
+                    final = await asyncio.to_thread(_ensure_playable, final, progress_cb)
                     logger.info(f"TikTok photo post dạng video: {final}")
                     return MediaResult("video", [final], title=title, duration=duration)
                 # Dạng B: `play` là MP3 nhạc nền → dùng làm audio
@@ -982,7 +983,7 @@ async def _download_via_tikwm(
                     await _http_download_stream(
                         music_url, audio_file, timeout=40, label="🎵 Tải nhạc nền",
                     )
-                    if not _probe_stream_codec(str(audio_file), "v:0"):
+                    if not await asyncio.to_thread(_probe_stream_codec, str(audio_file), "v:0"):
                         audio_path = str(audio_file)
                     else:
                         try:
@@ -1020,9 +1021,10 @@ async def _download_via_tikwm(
         # ── Dạng B: có ảnh + nhạc → render slideshow VIDEO (như post TikTok) ──
         if audio_path and paths:
             video_out = str(target_dir / f"{unique_id}.mp4")
-            audio_dur = _probe_duration(audio_path) or 10.0
+            audio_dur = await asyncio.to_thread(_probe_duration, audio_path) or 10.0
             try:
-                _make_photo_video(paths, audio_path, video_out, audio_dur)
+                # Chạy ffmpeg trong thread — tránh block event loop (bot không bị đơ)
+                await asyncio.to_thread(_make_photo_video, paths, audio_path, video_out, audio_dur)
                 for p in paths:
                     try:
                         os.remove(p)
@@ -1067,7 +1069,7 @@ async def _download_via_tikwm(
         return None
 
     logger.info(f"TikTok tikwm tải thành công: {file_path}")
-    file_path = _ensure_playable(str(file_path), progress_cb=progress_cb)
+    file_path = await asyncio.to_thread(_ensure_playable, str(file_path), progress_cb)
     return MediaResult("video", [str(file_path)], title=title, duration=duration)
 
 
