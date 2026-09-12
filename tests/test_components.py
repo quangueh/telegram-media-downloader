@@ -226,27 +226,31 @@ class TestTikTokPhotoPost(unittest.TestCase):
     def _fake_download(self, dest):
         return dest
 
-    async def _run(self, images):
+    async def _run(self, images, music_url="https://example.com/music.mp3"):
         import asyncio
         from downloader import _download_via_tikwm
 
         async def fake_stream(url, dest, **kwargs):
-            Path(dest).write_bytes(b"fake-image")
-            return len(b"fake-image")
+            # url chứa 'music' → giả audio (mp3), còn lại giả ảnh
+            data = b"fake-music-xx" if "music" in url else b"fake-image"
+            Path(dest).write_bytes(data)
+            return len(data)
 
         info = {
             "title": "Photo album test",
             "images": images,
-            "play": "https://example.com/music.mp3",
+            "play": music_url,
+            "music": music_url,
             "duration": 0,
             "size": 0,
         }
         with mock.patch("downloader._fetch_tikwm_info", new=mock.AsyncMock(return_value=info)):
             with mock.patch("downloader._http_download_stream", new=mock.AsyncMock(side_effect=fake_stream)):
-                return await _download_via_tikwm(
-                    "https://www.tiktok.com/@user/photo/123456",
-                    DOWNLOAD_DIR,
-                )
+                with mock.patch("downloader._probe_stream_codec", return_value=""):
+                    return await _download_via_tikwm(
+                        "https://www.tiktok.com/@user/photo/123456",
+                        DOWNLOAD_DIR,
+                    )
 
     def test_photo_post_single(self):
         result = asyncio_run(self._run(["https://example.com/1.jpg"]))
@@ -255,6 +259,15 @@ class TestTikTokPhotoPost(unittest.TestCase):
         self.assertEqual(len(result.paths), 1)
         self.assertEqual(result.title, "Photo album test")
         self.assertTrue(Path(result.paths[0]).exists())
+
+    def test_photo_post_with_music(self):
+        """Photo post có music phải trả kèm file audio."""
+        result = asyncio_run(self._run(["https://example.com/1.jpg"]))
+        self.assertIsNotNone(result)
+        self.assertEqual(result.kind, "photos")
+        self.assertIsNotNone(result.audio)
+        self.assertTrue(Path(result.audio).exists())
+        self.assertIn("audio", Path(result.audio).name)
 
     def test_photo_post_multiple(self):
         result = asyncio_run(self._run([
@@ -272,6 +285,7 @@ class TestTikTokPhotoPost(unittest.TestCase):
     def test_media_result_kind(self):
         self.assertEqual(MediaResult("video", ["a.mp4"], "T", 5).kind, "video")
         self.assertEqual(MediaResult("photos", ["a.jpg"], "T", 1).paths, ["a.jpg"])
+        self.assertIsNone(MediaResult("photos", ["a.jpg"]).audio)
 
 
 class TestPlatformDetection(unittest.TestCase):

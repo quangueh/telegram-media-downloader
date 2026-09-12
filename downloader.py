@@ -102,11 +102,12 @@ class VideoDownloadError(DownloaderError):
 
 @dataclass
 class MediaResult:
-    """Kết quả tải media từ một link — hỗ trợ cả video và album ảnh (TikTok photo)."""
+    """Kết quả tải media từ một link — hỗ trợ video, album ảnh (TikTok photo) và nhạc nền."""
     kind: str                       # "video" | "photos"
     paths: list                     # video: [path]; photos: [path1, path2, ...]
     title: str = "Media"
     duration: int = 0
+    audio: Optional[str] = None     # nhạc nền (photo post có kèm music), có thể None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -893,8 +894,33 @@ async def _download_via_tikwm(
             _cleanup_leftovers(target_dir, unique_id)
             logger.warning(f"Tải ảnh TikTok photo fail: {e}")
             return None
-        logger.info(f"TikTok photo post: {len(paths)} ảnh")
-        return MediaResult("photos", paths, title=title, duration=len(paths))
+
+        # ── Nhạc nền: photo post thường kèm music → tải kèm, gửi sau album ảnh ──
+        audio_path: Optional[str] = None
+        music_url = info.get("music") or info.get("play") or info.get("hdplay")
+        if music_url:
+            try:
+                audio_file = target_dir / f"{unique_id}_audio.mp3"
+                await _http_download_stream(
+                    music_url, audio_file, timeout=40, label="🎵 Tải nhạc nền",
+                )
+                # Chỉ giữ nếu là audio (không có video stream)
+                if not _probe_stream_codec(str(audio_file), "v:0"):
+                    audio_path = str(audio_file)
+                else:
+                    try:
+                        audio_file.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            except Exception as e:
+                logger.warning(f"Tải nhạc nền TikTok photo fail: {e}")
+                try:
+                    (target_dir / f"{unique_id}_audio.mp3").unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        logger.info(f"TikTok photo post: {len(paths)} ảnh" + (" + nhạc nền" if audio_path else ""))
+        return MediaResult("photos", paths, title=title, duration=len(paths), audio=audio_path)
 
     # ── TikTok VIDEO ──
     duration = int(info.get("duration") or 0)

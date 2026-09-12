@@ -761,7 +761,9 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             progress.update_sync(pct, text)
 
         result = await extract_and_download(url, progress_cb=_dl_progress)
-        downloaded_files = result.paths
+        downloaded_files = list(result.paths)
+        if getattr(result, "audio", None):
+            downloaded_files.append(result.audio)
         title = result.title
         duration = result.duration
 
@@ -801,6 +803,21 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         fh.close()
                     except Exception:
                         pass
+
+            # Gửi kèm nhạc nền (photo post TikTok có music) nếu tải được
+            audio = getattr(result, "audio", None)
+            if audio and os.path.exists(audio):
+                try:
+                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_AUDIO)
+                    with open(audio, "rb") as af:
+                        await context.bot.send_audio(
+                            chat_id=chat_id,
+                            audio=af,
+                            caption=f"🎵 Nhạc nền: {safe_title}",
+                            parse_mode=ParseMode.HTML,
+                        )
+                except Exception as e:
+                    logger.warning(f"Gửi nhạc nền TikTok fail: {e}")
         else:
             # ── VIDEO: gửi video như bình thường ──
             # Cập nhật trạng thái đang upload
