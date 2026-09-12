@@ -226,31 +226,66 @@ class TestTikTokPhotoPost(unittest.TestCase):
     def _fake_download(self, dest):
         return dest
 
-    async def _run(self, images, music_url="https://example.com/music.mp3"):
+    async def _run(self, images, music_url="https://example.com/music.mp3", video_codec="", render_ok=False):
         import asyncio
+        import contextlib
         from downloader import _download_via_tikwm
 
         async def fake_stream(url, dest, **kwargs):
-            # url chứa 'music' → giả audio (mp3), còn lại giả ảnh
             data = b"fake-music-xx" if "music" in url else b"fake-image"
             Path(dest).write_bytes(data)
             return len(data)
+
+        def fake_probe(path, stream):
+            # media video slideshow → v:0 trả codec; còn lại coi như audio/không video
+            if video_codec and stream == "v:0" and "_media" in str(path):
+                return video_codec
+            return ""
+
+        def fake_render(image_paths, audio_path, output_path, duration):
+            Path(output_path).write_bytes(b"fake-video")
+            return output_path
 
         info = {
             "title": "Photo album test",
             "images": images,
             "play": music_url,
             "music": music_url,
-            "duration": 0,
+            "duration": 15,
             "size": 0,
         }
-        with mock.patch("downloader._fetch_tikwm_info", new=mock.AsyncMock(return_value=info)):
-            with mock.patch("downloader._http_download_stream", new=mock.AsyncMock(side_effect=fake_stream)):
-                with mock.patch("downloader._probe_stream_codec", return_value=""):
-                    return await _download_via_tikwm(
-                        "https://www.tiktok.com/@user/photo/123456",
-                        DOWNLOAD_DIR,
-                    )
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch("downloader._fetch_tikwm_info", new=mock.AsyncMock(return_value=info)))
+            stack.enter_context(mock.patch("downloader._http_download_stream", new=mock.AsyncMock(side_effect=fake_stream)))
+            stack.enter_context(mock.patch("downloader._probe_stream_codec", side_effect=fake_probe))
+            if render_ok:
+                stack.enter_context(mock.patch("downloader._make_photo_video", side_effect=fake_render))
+            return await _download_via_tikwm(
+                "https://www.tiktok.com/@user/photo/123456",
+                DOWNLOAD_DIR,
+            )
+
+    def test_photo_post_slideshow_video(self):
+        """Photo post dạng slideshow (`play` là video thật) → trả VIDEO gốc."""
+        result = asyncio_run(self._run(["https://example.com/1.jpg"], video_codec="h264"))
+        self.assertIsNotNone(result)
+        self.assertEqual(result.kind, "video")
+        self.assertEqual(len(result.paths), 1)
+        self.assertIsNone(result.audio)
+
+    def test_photo_post_renders_video(self):
+        """Photo post ảnh + nhạc → render slideshow VIDEO (như post TikTok)."""
+        result = asyncio_run(self._run(["https://example.com/1.jpg"], render_ok=True))
+        self.assertIsNotNone(result)
+        self.assertEqual(result.kind, "video")
+        self.assertEqual(len(result.paths), 1)
+
+    def test_photo_post_render_fallback(self):
+        """Render fail → fallback gửi album ảnh + audio."""
+        result = asyncio_run(self._run(["https://example.com/1.jpg"], render_ok=False))
+        self.assertIsNotNone(result)
+        self.assertEqual(result.kind, "photos")
+        self.assertIsNotNone(result.audio)
 
     def test_photo_post_single(self):
         result = asyncio_run(self._run(["https://example.com/1.jpg"]))
@@ -261,7 +296,7 @@ class TestTikTokPhotoPost(unittest.TestCase):
         self.assertTrue(Path(result.paths[0]).exists())
 
     def test_photo_post_with_music(self):
-        """Photo post có music phải trả kèm file audio."""
+        """Photo post ảnh tĩnh + nhạc → trả kèm file audio."""
         result = asyncio_run(self._run(["https://example.com/1.jpg"]))
         self.assertIsNotNone(result)
         self.assertEqual(result.kind, "photos")

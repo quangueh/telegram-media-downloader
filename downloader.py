@@ -856,6 +856,68 @@ async def _fetch_tikwm_info(url: str) -> Optional[dict]:
     return data["data"]
 
 
+def _make_photo_video(
+    image_paths: list,
+    audio_path: str,
+    output_path: str,
+    duration: float,
+) -> str:
+    """Render 1/nhiều ảnh + nhạc nền thành video MP4 (H.264 + AAC).
+
+    TikTok photo post chỉ cung cấp ảnh + nhạc từ API (không có file video riêng),
+    nên muốn video phát được phải render slideshow bằng ffmpeg.
+    """
+    try:
+        if len(image_paths) == 1:
+            cmd = [
+                "ffmpeg", "-y",
+                "-loop", "1", "-i", image_paths[0],
+                "-i", audio_path,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k",
+                "-t", f"{duration:.2f}",
+                "-movflags", "+faststart",
+                "-loglevel", "error",
+                output_path,
+            ]
+        else:
+            seg = max(2.0, duration / len(image_paths))
+            inputs = []
+            for p in image_paths:
+                inputs += ["-loop", "1", "-t", f"{seg:.2f}", "-i", p]
+            inputs += ["-i", audio_path]
+            filters = [
+                (
+                    f"[{i}:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
+                    f"pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[v{i}]"
+                )
+                for i in range(len(image_paths))
+            ]
+            filters.append(
+                "".join(f"[v{i}]" for i in range(len(image_paths)))
+                + f"concat=n={len(image_paths)}:v=1:a=0[vout]"
+            )
+            cmd = [
+                "ffmpeg", "-y", *inputs,
+                "-filter_complex", ";".join(filters),
+                "-map", "[vout]", "-map", f"{len(image_paths)}:a",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-t", f"{duration:.2f}",
+                "-movflags", "+faststart",
+                "-loglevel", "error",
+                output_path,
+            ]
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        if result.returncode != 0 or not os.path.exists(output_path):
+            raise RuntimeError(
+                f"FFmpeg slideshow fail: {result.stderr.decode('utf-8', errors='replace')[-200:]}"
+            )
+        return output_path
+    except Exception as e:
+        raise RuntimeError(f"FFmpeg slideshow error: {e}")
+
+
 async def _download_via_tikwm(
     url: str,
     output_dir: Path,
@@ -872,10 +934,65 @@ async def _download_via_tikwm(
     target_dir.mkdir(parents=True, exist_ok=True)
     unique_id = uuid.uuid4().hex[:10]
 
-    # ── TikTok PHOTO POST: tikwm trả danh sách ảnh (`images`), còn `play` chỉ là
-    #    nhạc nền (MP3) → tải các ảnh và gửi dạng album, KHÔNG xử lý như video.
+    # ── TikTok PHOTO POST: có 2 dạng ──
+    #  A) `play`/`hdplay` là VIDEO thật (post mixed/đặc biệt) → gửi video gốc
+    #  B) Ảnh + nhạc (phổ biến): tikwm chỉ cấp ảnh + MP3 → render slideshow video
     images = info.get("images") or []
+    duration = int(info.get("duration") or 0)
     if images:
+        audio_path: Optional[str] = None
+        media_url = info.get("play") or info.get("hdplay")
+        if media_url:
+            media_file = target_dir / f"{unique_id}_media.bin"
+            try:
+                await _http_download_stream(
+                    media_url, media_file, timeout=40, label="⏳ Kiểm tra media...",
+                )
+                vcodec = _probe_stream_codec(str(media_file), "v:0")
+                if vcodec:
+                    # Dạng A: video slideshow sẵn có → gửi video gốc
+                    final = str(target_dir / f"{unique_id}.mp4")
+                    try:
+                        os.replace(media_file, final)
+                    except OSError:
+                        final = str(media_file)
+                    final = _ensure_playable(final, progress_cb=progress_cb)
+                    logger.info(f"TikTok photo post dạng video: {final}")
+                    return MediaResult("video", [final], title=title, duration=duration)
+                # Dạng B: `play` là MP3 nhạc nền → dùng làm audio
+                audio_file = str(target_dir / f"{unique_id}_audio.mp3")
+                try:
+                    os.replace(media_file, audio_file)
+                except OSError:
+                    audio_file = str(media_file)
+                audio_path = audio_file
+            except Exception as e:
+                logger.warning(f"Kiểm tra media photo post fail: {e}")
+                try:
+                    media_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        # Dạng B chưa có audio (play lỗi) → thử field `music`
+        if not audio_path:
+            music_url = info.get("music")
+            if music_url:
+                try:
+                    audio_file = target_dir / f"{unique_id}_audio.mp3"
+                    await _http_download_stream(
+                        music_url, audio_file, timeout=40, label="🎵 Tải nhạc nền",
+                    )
+                    if not _probe_stream_codec(str(audio_file), "v:0"):
+                        audio_path = str(audio_file)
+                    else:
+                        try:
+                            audio_file.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                except Exception as e:
+                    logger.warning(f"Tải nhạc nền TikTok photo fail: {e}")
+
+        # Tải các ảnh
         paths: list = []
         try:
             for i, img_url in enumerate(images, 1):
@@ -891,40 +1008,39 @@ async def _download_via_tikwm(
                     os.remove(p)
                 except OSError:
                     pass
+            if audio_path:
+                try:
+                    os.remove(audio_path)
+                except OSError:
+                    pass
             _cleanup_leftovers(target_dir, unique_id)
             logger.warning(f"Tải ảnh TikTok photo fail: {e}")
             return None
 
-        # ── Nhạc nền: photo post thường kèm music → tải kèm, gửi sau album ảnh ──
-        audio_path: Optional[str] = None
-        music_url = info.get("music") or info.get("play") or info.get("hdplay")
-        if music_url:
+        # ── Dạng B: có ảnh + nhạc → render slideshow VIDEO (như post TikTok) ──
+        if audio_path and paths:
+            video_out = str(target_dir / f"{unique_id}.mp4")
+            audio_dur = _probe_duration(audio_path) or 10.0
             try:
-                audio_file = target_dir / f"{unique_id}_audio.mp3"
-                await _http_download_stream(
-                    music_url, audio_file, timeout=40, label="🎵 Tải nhạc nền",
-                )
-                # Chỉ giữ nếu là audio (không có video stream)
-                if not _probe_stream_codec(str(audio_file), "v:0"):
-                    audio_path = str(audio_file)
-                else:
+                _make_photo_video(paths, audio_path, video_out, audio_dur)
+                for p in paths:
                     try:
-                        audio_file.unlink(missing_ok=True)
+                        os.remove(p)
                     except OSError:
                         pass
-            except Exception as e:
-                logger.warning(f"Tải nhạc nền TikTok photo fail: {e}")
                 try:
-                    (target_dir / f"{unique_id}_audio.mp3").unlink(missing_ok=True)
+                    os.remove(audio_path)
                 except OSError:
                     pass
+                logger.info(f"TikTok photo post → video: {video_out}")
+                return MediaResult("video", [video_out], title=title, duration=int(audio_dur))
+            except Exception as e:
+                logger.warning(f"Render slideshow fail, gửi ảnh + nhạc riêng: {e}")
 
         logger.info(f"TikTok photo post: {len(paths)} ảnh" + (" + nhạc nền" if audio_path else ""))
         return MediaResult("photos", paths, title=title, duration=len(paths), audio=audio_path)
 
     # ── TikTok VIDEO ──
-    duration = int(info.get("duration") or 0)
-
     estimated_size = info.get("size") or 0
     if isinstance(estimated_size, (int, float)) and estimated_size > MAX_FILE_SIZE:
         raise VideoTooLargeError(int(estimated_size), MAX_FILE_SIZE)
