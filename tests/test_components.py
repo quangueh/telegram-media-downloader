@@ -527,6 +527,29 @@ class TestYtdlpOptsAttempts(unittest.TestCase):
         opts_gen = _build_ytdlp_opts("https://example.com/x", Path(tempfile.gettempdir()), "uid")
         self.assertNotIn("extractor_args", opts_gen)
 
+    def test_youtube_proxy_and_pot_provider(self):
+        import tempfile
+        from downloader import _build_ytdlp_opts
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "YOUTUBE_PROXY": "http://proxy-user:proxy-pass@proxy.example:8080",
+                "YOUTUBE_POT_PROVIDER_URL": "http://pot.example:4416",
+            },
+            clear=False,
+        ):
+            opts = _build_ytdlp_opts(
+                "https://www.youtube.com/watch?v=abc123xyz99",
+                Path(tempfile.gettempdir()),
+                "uid",
+            )
+        self.assertEqual(opts["proxy"], "http://proxy-user:proxy-pass@proxy.example:8080")
+        self.assertEqual(
+            opts["extractor_args"]["youtubepot-bgutilhttp"]["base_url"],
+            "http://pot.example:4416",
+        )
+
 
 class TestRunExecutor(unittest.TestCase):
     """Executor chạy nền: heartbeat progress + timeout — không treo vô hạn."""

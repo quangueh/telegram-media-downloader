@@ -579,8 +579,13 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _clean_error(e: BaseException) -> str:
-    """Làm sạch thông điệp lỗi: bỏ ANSI codes, giới hạn độ dài."""
+    """Làm sạch thông điệp lỗi: bỏ ANSI codes, ẩn URL nhạy cảm, giới hạn độ dài."""
     msg = _ANSI_RE.sub("", str(e)).strip()
+    msg = re.sub(
+        r"https?://[^\s<>]+",
+        lambda match: redact_url(match.group(0)),
+        msg,
+    )
     if len(msg) > 280:
         msg = msg[:280] + "..."
     return msg
@@ -652,6 +657,11 @@ def _build_ytdlp_opts(
         },
     }
 
+    if _is_youtube_url(url):
+        youtube_proxy = os.getenv("YOUTUBE_PROXY", "").strip()
+        if youtube_proxy:
+            opts["proxy"] = youtube_proxy
+
     # YouTube: ưu tiên format H.264 + AAC <45MB (giống nhau ở mọi attempt)
     if _is_youtube_url(url):
         opts["format"] = (
@@ -677,6 +687,13 @@ def _build_ytdlp_opts(
             logger.info("YouTube: dùng player client android_vr (attempt 3)")
             opts["extractor_args"] = {
                 "youtube": {"player_client": "android_vr"}
+            }
+
+    if _is_youtube_url(url):
+        provider_url = os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip()
+        if provider_url:
+            opts.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {
+                "base_url": provider_url,
             }
 
     # Cookies theo platform (giúp tải từ IP datacenter bị chặn)
@@ -1556,9 +1573,9 @@ async def _extract_and_download_impl(
 
         hint = (
             "\n\n💡 <b>IP máy chủ đang bị YouTube chặn.</b> Cách khắc phục:\n"
-            "1️⃣ Đặt <code>YOUTUBE_COOKIES</code> (hoặc <code>YOUTUBE_COOKIES_B64</code>) "
-            "với cookie Netscape từ trình duyệt đã đăng nhập YouTube — hiệu quả nhất.\n"
-            "2️⃣ Chạy PO-token server (<code>bgutil-ytdlp-pot-provider</code>) cạnh bot."
+            "1️⃣ Ưu tiên proxy sạch/residential qua <code>YOUTUBE_PROXY</code>.\n"
+            "2️⃣ Hoặc kết nối <code>YOUTUBE_POT_PROVIDER_URL</code> tới PO-token provider.\n"
+            "⚠️ Không nên dùng cookie tài khoản Google chính; YouTube có thể khóa tài khoản."
         )
         raise VideoDownloadError(
             "YouTube: tất cả backend đều thất bại.\n"

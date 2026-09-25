@@ -1185,9 +1185,13 @@ def log_build_info() -> None:
         os.getenv("YOUTUBE_COOKIES", "").strip()
         or os.getenv("YOUTUBE_COOKIES_B64", "").strip()
     )
+    proxy_configured = bool(os.getenv("YOUTUBE_PROXY", "").strip())
+    provider_configured = bool(os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip())
     logger.info(
         f"BUILD INFO — commit: {commit} | yt-dlp: {yt_dlp.version.__version__} | "
         f"YT player clients: {YOUTUBE_PLAYER_CLIENTS} | "
+        f"YouTube proxy: {'CẤU HÌNH' if proxy_configured else 'chưa có'} | "
+        f"PO provider: {'CẤU HÌNH' if provider_configured else 'chưa có'} | "
         f"YouTube cookies: {'CẤU HÌNH' if cookies_configured else 'chưa có'}"
     )
 

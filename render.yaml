@@ -27,6 +27,10 @@ services:
         value: ""
       - key: YOUTUBE_COOKIES_B64
         sync: false
+      - key: YOUTUBE_PROXY
+        sync: false
+      - key: YOUTUBE_POT_PROVIDER_URL
+        sync: false
       - key: TIKTOK_COOKIES
         value: ""
       - key: ADMIN_USER_ID

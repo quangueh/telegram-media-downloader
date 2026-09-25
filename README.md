@@ -100,13 +100,12 @@ telegram-media-downloader/
     LOG_LEVEL=INFO
     ```
 
-5. *(Tùy chọn — chỉ dùng khi server bị chặn)* Không gửi cookie vào log hoặc commit. Lưu nội dung Netscape trong secret manager / biến môi trường của deployment:
+5. *(Tùy chọn — khi IP server bị YouTube chặn)* Ưu tiên proxy sạch/residential hoặc PO-token provider; không gửi secret vào log hoặc commit:
    ```env
-   YOUTUBE_COOKIES=<nội dung cookies.txt của YouTube>
-   YOUTUBE_COOKIES_B64=<nội dung cookies.txt mã hóa Base64, dùng thay biến trên>
-   TIKTOK_COOKIES=<nội dung cookies.txt của TikTok>
+   YOUTUBE_PROXY=http://user:password@proxy-host:port
+   YOUTUBE_POT_PROVIDER_URL=http://provider-host:4416
    ```
-   Bot tạo file cookie tạm riêng, giới hạn quyền truy cập và xóa sau mỗi lần tải.
+   `YOUTUBE_COOKIES`/`YOUTUBE_COOKIES_B64` vẫn được hỗ trợ cho trường hợp tự chịu rủi ro, nhưng không nên dùng cookie tài khoản Google chính vì YouTube có thể khóa tài khoản. `TIKTOK_COOKIES` dùng cho cookie TikTok.
 
 
 6. **Khởi chạy bot:**

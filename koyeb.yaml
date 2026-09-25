@@ -23,3 +23,7 @@ services:
         value: "600"
       - key: URL_VALIDATION_TIMEOUT
         value: "8"
+      - key: YOUTUBE_PROXY
+        value: ""
+      - key: YOUTUBE_POT_PROVIDER_URL
+        value: ""
