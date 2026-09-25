@@ -92,6 +92,17 @@ class TestDownloaderComponents(unittest.TestCase):
         self.assertIn("55.0MB", str(err))
         self.assertIn("49MB", str(err))
 
+    def test_safe_error_detail_preserves_diagnostic_without_query(self):
+        from bot import _safe_error_detail
+
+        detail = _safe_error_detail(
+            "HTTP 403 https://youtu.be/abc?sig=secret&token=hidden"
+        )
+        self.assertIn("HTTP 403", detail)
+        self.assertIn("https://youtu.be/abc", detail)
+        self.assertNotIn("secret", detail)
+        self.assertNotIn("hidden", detail)
+
     def test_cleanup_leftovers(self):
         """Kiểm tra dọn dẹp các tệp tin tạm chứa unique_id."""
         from downloader import _cleanup_leftovers

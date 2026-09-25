@@ -173,6 +173,17 @@ async def _report_progress_error(progress, message, text: str) -> bool:
     return await _safe_reply(message, text, ParseMode.HTML)
 
 
+def _safe_error_detail(error: BaseException | str, max_length: int = 2500) -> str:
+    text = str(error)
+    text = re.sub(r"https?://[^\s<>]+", lambda match: redact_url(match.group(0), 180), text)
+    text = re.sub(
+        r"(?i)(cookie(?:s)?\s*[:=]\s*)[^\n]+",
+        r"\1[redacted]",
+        text,
+    )
+    return text[:max_length]
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Xử lý lệnh /start - Chào mừng và hướng dẫn người dùng."""
     user = update.effective_user
@@ -1106,15 +1117,18 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         error_text = (
             "❌ <b>Không thể tải video từ liên kết này!</b>\n\n"
-            "Vui lòng kiểm tra lại:\n"
-            "• Liên kết đúng và video ở chế độ công khai.\n"
-            "• Video không bị khóa riêng tư hoặc giới hạn độ tuổi."
+            "<b>Chi tiết lỗi backend:</b>\n"
+            f"<pre>{html.escape(_safe_error_detail(e))}</pre>"
         )
         await _report_progress_error(progress, message, error_text)
 
     except Exception as e:
         logger.error(f"Lỗi không lường trước khi xử lý tin nhắn: {e}", exc_info=True)
-        error_text = "❌ Đã có sự cố kỹ thuật xảy ra trong quá trình xử lý. Vui lòng thử lại sau!"
+        detail = _safe_error_detail(f"{type(e).__name__}: {e}")
+        error_text = (
+            "❌ <b>Đã xảy ra lỗi kỹ thuật:</b>\n"
+            f"<pre>{html.escape(detail)}</pre>"
+        )
         await _report_progress_error(progress, message, error_text)
 
     finally:
