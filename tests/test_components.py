@@ -6,6 +6,7 @@ import subprocess
 import unittest
 from unittest import mock
 from pathlib import Path
+from types import SimpleNamespace
 
 # Thêm thư mục dự án vào sys.path
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -15,6 +16,7 @@ import yt_dlp
 
 from config import MAX_FILE_SIZE, DOWNLOAD_DIR
 from security import InvalidURL, redact_url, validate_public_url
+from bot import _extract_url_from_message
 from downloader import (
     VideoTooLargeError,
     VideoDownloadError,
@@ -325,6 +327,48 @@ class TestTikTokPhotoPost(unittest.TestCase):
         self.assertEqual(MediaResult("video", ["a.mp4"], "T", 5).kind, "video")
         self.assertEqual(MediaResult("photos", ["a.jpg"], "T", 1).paths, ["a.jpg"])
         self.assertIsNone(MediaResult("photos", ["a.jpg"]).audio)
+
+
+class TestMessageUrlExtraction(unittest.TestCase):
+    def test_extracts_raw_and_bare_urls(self):
+        raw = SimpleNamespace(
+            text="watch https://www.tiktok.com/@user/video/123).",
+            caption=None, entities=None, caption_entities=None,
+        )
+        bare = SimpleNamespace(
+            text="www.youtube.com/watch?v=abcdefghijk",
+            caption=None, entities=None, caption_entities=None,
+        )
+        self.assertEqual(
+            _extract_url_from_message(raw),
+            "https://www.tiktok.com/@user/video/123",
+        )
+        self.assertEqual(
+            _extract_url_from_message(bare),
+            "https://www.youtube.com/watch?v=abcdefghijk",
+        )
+
+    def test_extracts_text_link_and_caption(self):
+        linked = SimpleNamespace(
+            text="open this",
+            caption=None,
+            entities=[SimpleNamespace(type="text_link", url="https://youtu.be/abcdefghijk")],
+            caption_entities=None,
+        )
+        caption = SimpleNamespace(
+            text=None,
+            caption="https://example.com/video",
+            entities=None,
+            caption_entities=None,
+        )
+        self.assertEqual(
+            _extract_url_from_message(linked),
+            "https://youtu.be/abcdefghijk",
+        )
+        self.assertEqual(
+            _extract_url_from_message(caption),
+            "https://example.com/video",
+        )
 
 
 class TestUrlSecurity(unittest.TestCase):

@@ -24,8 +24,10 @@ from typing import Optional
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
+from config import logger
+
 # Tối thiểu giữa 2 lần edit — tránh Telegram "Too Many Requests"
-MIN_EDIT_INTERVAL = 1.0
+MIN_EDIT_INTERVAL = 3.0
 # Bỏ qua update nếu % tăng < ngưỡng này (kể cả đã đến interval)
 MIN_PCT_DELTA = 1.0
 
@@ -55,27 +57,30 @@ class TelegramProgress:
         self._update_scheduled = False
         self._create_task = asyncio.create_task(self._send(initial_text))
 
-    async def _send(self, text: str) -> None:
+    async def _send(self, text: str) -> bool:
         try:
             self._message = await self.context.bot.send_message(
                 chat_id=self.chat_id,
                 text=text,
                 parse_mode=ParseMode.HTML,
             )
-        except Exception:
+            return True
+        except Exception as exc:
             self._message = None
+            logger.warning("Không tạo được progress message: %s", exc)
+            return False
 
-    async def update(self, pct: Optional[float], text: Optional[str] = None) -> None:
-        """Cập nhật % + text. Throttle: ≥2s kể từ lần edit cuối và ≥2% tăng thêm."""
+    async def update(self, pct: Optional[float], text: Optional[str] = None) -> bool:
         if self._finished or self._message is None:
-            return
+            return False
         now = time.monotonic()
-        # Điều kiện throttle: đủ interval, % tăng đủ lớn
         if now - self._last_edit < MIN_EDIT_INTERVAL:
-            return
+            return False
         if pct is not None:
+            if pct < self._last_pct:
+                self._last_pct = -100.0
             if pct - self._last_pct < MIN_PCT_DELTA:
-                return
+                return False
             self._last_pct = pct
         self._last_edit = now
 
@@ -84,38 +89,44 @@ class TelegramProgress:
         msg = f"{html.escape(self.title)}\n{bar}\n{html.escape(content)}".strip()
         try:
             await self._message.edit_text(msg, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
+            return True
+        except Exception as exc:
+            logger.warning("Không cập nhật được progress message: %s", exc)
+            return False
 
-    async def finish(self, text: str) -> None:
-        """Edit lần cuối — xóa thanh progress, chỉ để kết quả (HTML text)."""
+
+    async def finish(self, text: str) -> bool:
         if self._finished or self._message is None:
-            return
+            return False
         self._finished = True
         try:
             await self._message.edit_text(text, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
+            return True
+        except Exception as exc:
+            logger.warning("Không hoàn tất được progress message: %s", exc)
+            return False
 
-    async def fail(self, text: str) -> None:
-        """Edit lần cuối khi lỗi (HTML text)."""
+    async def fail(self, text: str) -> bool:
         if self._message is None:
-            return
+            return False
         self._finished = True
         try:
             await self._message.edit_text(text, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
+            return True
+        except Exception as exc:
+            logger.warning("Không báo lỗi qua progress message: %s", exc)
+            return False
 
-    async def delete(self) -> None:
-        """Xóa tin nhắn progress (dùng sau khi gửi xong media)."""
+    async def delete(self) -> bool:
         self._finished = True
         if self._message is None:
-            return
+            return False
         try:
             await self._message.delete()
-        except Exception:
-            pass
+            return True
+        except Exception as exc:
+            logger.warning("Không xóa được progress message: %s", exc)
+            return False
 
     async def _update_from_sync(
         self, pct: Optional[float], text: Optional[str]

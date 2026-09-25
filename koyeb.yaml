@@ -21,3 +21,5 @@ services:
         value: "5"
       - key: MAX_VIDEO_DURATION
         value: "600"
+      - key: URL_VALIDATION_TIMEOUT
+        value: "8"

@@ -25,6 +25,7 @@ from config import (
     MAX_PHOTO_COUNT,
     MAX_ALBUM_DURATION,
     MAX_VIDEO_DURATION,
+    URL_VALIDATION_TIMEOUT,
     DOWNLOAD_DIR,
     ALLOW_PRIVATE_URLS,
     logger,
@@ -1426,8 +1427,16 @@ async def extract_and_download(
     url: str,
     output_path: Optional[Union[str, Path]] = None,
     progress_cb: ProgressCB = None,
+    _skip_validation: bool = False,
 ) -> MediaResult:
-    validated_url = await asyncio.to_thread(validate_media_url, url)
+    if _skip_validation:
+        validated_url = url
+    else:
+        validated_url = await asyncio.wait_for(
+            asyncio.to_thread(validate_media_url, url),
+            timeout=URL_VALIDATION_TIMEOUT,
+        )
+    logger.info("Bắt đầu download job: %s", redact_url(validated_url))
     parent_dir = Path(output_path) if output_path else DOWNLOAD_DIR
     job_dir = _new_job_dir(parent_dir)
     try:
@@ -1435,6 +1444,7 @@ async def extract_and_download(
             validated_url, job_dir, progress_cb,
         )
         result.cleanup_dir = str(job_dir)
+        logger.info("Hoàn tất download job: %s", redact_url(validated_url))
         return result
     except BaseException:
         _remove_path(job_dir)

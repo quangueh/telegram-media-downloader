@@ -34,6 +34,7 @@ from config import (
     MAX_CONCURRENT_JOBS,
     MAX_PHOTO_COUNT,
     MAX_TEXT_LENGTH,
+    URL_VALIDATION_TIMEOUT,
     USER_RATE_LIMIT_SECONDS,
     logger,
     DOWNLOAD_DIR,
@@ -126,6 +127,50 @@ def _request_allowed(user_id: int) -> bool:
 
 
 URL_REGEX = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+BARE_URL_REGEX = re.compile(
+    r"(?:www\.)?(?:tiktok\.com|douyin\.com|iesdouyin\.com|youtube\.com|youtu\.be|facebook\.com|fb\.watch)/[^\s<>()]+",
+    re.IGNORECASE,
+)
+
+
+def _extract_url_from_message(message) -> str:
+    text = message.text or message.caption or ""
+    match = URL_REGEX.search(text)
+    if match:
+        return match.group(0).rstrip(".,!?;:]})\"")
+    entities = getattr(message, "entities", None) or getattr(message, "caption_entities", None) or []
+    for entity in entities:
+        if entity.type == "text_link" and entity.url:
+            return str(entity.url)
+        if entity.type == "url":
+            candidate = text[entity.offset:entity.offset + entity.length]
+            if candidate:
+                return candidate.rstrip(".,!?;:]})\"")
+    bare = BARE_URL_REGEX.search(text)
+    if bare:
+        candidate = bare.group(0).rstrip(".,!?;:]})\"")
+        return f"https://{candidate}"
+    return ""
+
+
+async def _safe_reply(message, text: str, parse_mode=None) -> bool:
+    if not message:
+        return False
+    try:
+        await asyncio.wait_for(
+            message.reply_text(text, parse_mode=parse_mode),
+            timeout=10,
+        )
+        return True
+    except Exception as exc:
+        logger.warning("Không gửi được phản hồi Telegram: %s", exc)
+        return False
+
+
+async def _report_progress_error(progress, message, text: str) -> bool:
+    if progress and await progress.fail(text):
+        return True
+    return await _safe_reply(message, text, ParseMode.HTML)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -153,6 +198,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "• ⌨️ /ascii — Ảnh → ASCII art\n\n"
         "📌 <b>Cách sử dụng:</b>\n"
         "• Gửi link video → tải tự động\n"
+        "• Hoặc dùng <code>/download &lt;link&gt;</code>\n"
         "• Gõ lệnh tool → gửi ảnh → nhận kết quả\n\n"
         "⚠️ <i>Lưu ý: Telegram Bot giới hạn file tối đa <b>50MB</b>.</i>"
     )
@@ -804,43 +850,114 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Xử lý tin nhắn chứa liên kết video, thực hiện tải và gửi video về người dùng."""
-    if not update.message or not update.message.text:
+    message = update.effective_message
+    if not message:
         return
 
-    text = update.message.text.strip()
-    match = URL_REGEX.search(text)
-    if not match:
+    url = _extract_url_from_message(message)
+    if not url:
         return
-    url = match.group(0).rstrip(".,!?;:]}\"")
     user = update.effective_user
-    user_id = user.id if user else 0
-    try:
-        url = await asyncio.to_thread(validate_media_url, url)
-    except InvalidURL as exc:
-        await update.message.reply_text(
-            f"⛔ URL không được phép: {html.escape(str(exc))}",
-            parse_mode=ParseMode.HTML,
-        )
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is None:
         return
+    logger.info(
+        "URL update received update_id=%s chat_id=%s user_id=%s",
+        getattr(update, "update_id", "unknown"),
+        chat_id,
+        user.id if user else 0,
+    )
+    user_id = user.id if user else 0
     if not _request_allowed(user_id):
-        await update.message.reply_text("⏳ Bạn gửi yêu cầu quá nhanh. Vui lòng thử lại sau.")
+        await _safe_reply(message, "⏳ Bạn gửi yêu cầu quá nhanh. Vui lòng thử lại sau.")
         return
 
     try:
         await asyncio.wait_for(_download_slots.acquire(), timeout=0.25)
     except asyncio.TimeoutError:
-        await update.message.reply_text("⏳ Hệ thống đang xử lý các yêu cầu khác. Vui lòng thử lại sau.")
+        await _safe_reply(message, "⏳ Hệ thống đang xử lý các yêu cầu khác. Vui lòng thử lại sau.")
+        return
+    except Exception as exc:
+        logger.error("Không acquire được slot tải media: %s", exc)
+        await _safe_reply(message, "❌ Hệ thống đang bận. Vui lòng thử lại sau.")
         return
 
     job_acquired = True
-    chat_id = update.effective_chat.id
     progress = None
     downloaded_files: list = []
     cleanup_dir = None
     result = None
+    try:
+        progress = TelegramProgress(
+            context, chat_id,
+            initial_text="⏳ <b>Đã nhận link, đang kiểm tra...</b>",
+            title="🎬 Đang xử lý",
+        )
+        try:
+            await asyncio.wait_for(progress._create_task, timeout=10)
+        except Exception as exc:
+            logger.warning("Không chờ được progress message: %s", exc)
+    except asyncio.CancelledError:
+        if job_acquired:
+            _download_slots.release()
+        raise
+    except Exception as exc:
+        logger.error("Không khởi tạo được progress: %s", exc)
+        if job_acquired:
+            _download_slots.release()
+        await _safe_reply(message, "❌ Không thể khởi tạo xử lý media. Vui lòng thử lại sau.")
+        return
+
+    try:
+        url = await asyncio.wait_for(
+            asyncio.to_thread(validate_media_url, url),
+            timeout=URL_VALIDATION_TIMEOUT,
+        )
+    except asyncio.CancelledError:
+        if job_acquired:
+            _download_slots.release()
+            job_acquired = False
+        raise
+    except InvalidURL as exc:
+        await _report_progress_error(
+            progress, message,
+            f"⛔ URL không được phép: {html.escape(str(exc))}",
+        )
+        if job_acquired:
+            _download_slots.release()
+            job_acquired = False
+        return
+    except asyncio.TimeoutError:
+        logger.warning("URL validation timeout update_id=%s", getattr(update, "update_id", "unknown"))
+        await _report_progress_error(
+            progress, message,
+            "⏳ Kiểm tra link quá thời gian. Vui lòng thử lại sau.",
+        )
+        if job_acquired:
+            _download_slots.release()
+            job_acquired = False
+        return
+    except Exception as exc:
+        logger.error("URL validation lỗi: %s", exc, exc_info=True)
+        await _report_progress_error(
+            progress, message,
+            "❌ Không thể kiểm tra link. Vui lòng thử lại sau.",
+        )
+        if job_acquired:
+            _download_slots.release()
+            job_acquired = False
+        return
 
     from urllib.parse import urlsplit
-    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    try:
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    except Exception as exc:
+        logger.error("Không phân tích được host URL: %s", exc)
+        await _report_progress_error(progress, message, "❌ Link không hợp lệ.")
+        if job_acquired:
+            _download_slots.release()
+            job_acquired = False
+        return
     if host == "tiktok.com" or host.endswith(".tiktok.com"):
         platform = "TikTok"
     elif host == "douyin.com" or host.endswith(".douyin.com") or host == "iesdouyin.com" or host.endswith(".iesdouyin.com"):
@@ -851,25 +968,21 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         platform = "Facebook"
     else:
         platform = "Other"
+    progress.title = f"🎬 {platform}"
 
     try:
-        # Gửi tin nhắn tiến trình — tự cập nhật % trong lúc tải
-        progress = TelegramProgress(
-            context, chat_id,
-            initial_text="⏳ <b>Đang tải và xử lý media...</b>",
-            title=f"🎬 {platform}",
-        )
-        # Đợi message được tạo (create_task trong __init__)
-        await progress._create_task
-
-        # Hiển thị hành động bot đang tải video
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+        except Exception as exc:
+            logger.debug("Không gửi được chat action: %s", exc)
 
         # Gọi hàm tải video bất đồng bộ — truyền progress callback
         def _dl_progress(pct, text):
             progress.update_sync(pct, text)
 
-        result = await extract_and_download(url, progress_cb=_dl_progress)
+        result = await extract_and_download(
+            url, progress_cb=_dl_progress, _skip_validation=True,
+        )
         cleanup_dir = getattr(result, "cleanup_dir", None)
         downloaded_files = list(result.paths)
         if getattr(result, "audio", None):
@@ -981,10 +1094,7 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"⚠️ <b>Không thể gửi video:</b>\n{str(e)}\n\n"
             "💡 <i>Gợi ý: Do giới hạn Telegram Bot API là 50MB, bạn hãy thử tải các video ngắn hơn hoặc độ phân giải thấp hơn.</i>"
         )
-        if progress and progress._message:
-            await progress.fail(error_text)
-        else:
-            await update.message.reply_text(error_text, parse_mode=ParseMode.HTML)
+        await _report_progress_error(progress, message, error_text)
 
     except VideoDownloadError as e:
         logger.error("Lỗi tải video %s: %s", redact_url(url), e)
@@ -1000,21 +1110,12 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "• Liên kết đúng và video ở chế độ công khai.\n"
             "• Video không bị khóa riêng tư hoặc giới hạn độ tuổi."
         )
-        if progress and progress._message:
-            await progress.fail(error_text)
-        else:
-            await update.message.reply_text(error_text, parse_mode=ParseMode.HTML)
+        await _report_progress_error(progress, message, error_text)
 
     except Exception as e:
         logger.error(f"Lỗi không lường trước khi xử lý tin nhắn: {e}", exc_info=True)
         error_text = "❌ Đã có sự cố kỹ thuật xảy ra trong quá trình xử lý. Vui lòng thử lại sau!"
-        if progress and progress._message:
-            try:
-                await progress.fail(error_text)
-            except Exception:
-                pass
-        else:
-            await update.message.reply_text(error_text)
+        await _report_progress_error(progress, message, error_text)
 
     finally:
         for tmp_file in downloaded_files:
@@ -1027,6 +1128,8 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     error = context.error
+    if isinstance(error, asyncio.CancelledError):
+        return
     if isinstance(error, BaseException):
         logger.error(
             "Ngoại lệ phát sinh khi xử lý update:",
@@ -1034,6 +1137,12 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
         )
     else:
         logger.error("Ngoại lệ phát sinh khi xử lý update: %s", error)
+    message = getattr(update, "effective_message", None)
+    if message:
+        await _safe_reply(
+            message,
+            "❌ Đã xảy ra lỗi khi xử lý yêu cầu. Vui lòng thử lại sau!",
+        )
 
 
 def log_build_info() -> None:
@@ -1041,15 +1150,22 @@ def log_build_info() -> None:
     import subprocess
     import yt_dlp
 
-    try:
-        commit = (
-            subprocess.run(
-                ["git", "rev-parse", "--short", "HEAD"],
-                capture_output=True, text=True, timeout=5,
-            ).stdout.strip() or "unknown"
-        )
-    except Exception:
-        commit = "unknown (no git in container)"
+    commit = (
+        os.getenv("RENDER_GIT_COMMIT")
+        or os.getenv("KOYEB_GIT_COMMIT")
+        or os.getenv("GIT_COMMIT")
+        or "unknown"
+    )
+    if commit == "unknown":
+        try:
+            commit = (
+                subprocess.run(
+                    ["git", "rev-parse", "--short", "HEAD"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip() or "unknown"
+            )
+        except Exception:
+            commit = "unknown (no git in container)"
 
     cookies_configured = bool(os.getenv("YOUTUBE_COOKIES", "").strip())
     logger.info(
@@ -1132,6 +1248,17 @@ def start_health_check_server(port: int) -> None:
 
 
 async def _mark_application_ready(application) -> None:
+    try:
+        bot_info = await asyncio.wait_for(application.bot.get_me(), timeout=15)
+        logger.info(
+            "Telegram bot đã xác thực: @%s id=%s",
+            getattr(bot_info, "username", "unknown"),
+            getattr(bot_info, "id", "unknown"),
+        )
+    except Exception:
+        _bot_ready.clear()
+        logger.exception("Không thể xác thực BOT_TOKEN với Telegram")
+        raise
     _bot_shutdown.clear()
     _bot_ready.set()
 
@@ -1166,9 +1293,9 @@ def main() -> None:
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .rate_limiter(AIORateLimiter(
-            overall_max_rate=0.5,
+            overall_max_rate=5.0,
             overall_time_period=1.0,
-            group_max_rate=10,
+            group_max_rate=20,
             group_time_period=60.0,
             max_retries=2,
         ))
@@ -1185,6 +1312,8 @@ def main() -> None:
     application.add_handler(CommandHandler("enhance", enhance_command))
     application.add_handler(CommandHandler("beautify", beautify_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
+    application.add_handler(CommandHandler("download", handle_video_url))
+    application.add_handler(CommandHandler("dl", handle_video_url))
     # 10 Tools
     application.add_handler(CommandHandler("qr", qr_command))
     application.add_handler(CommandHandler("sticker", sticker_command))
@@ -1197,14 +1326,16 @@ def main() -> None:
     application.add_handler(CommandHandler("roll", roll_command))
     application.add_handler(CommandHandler("ascii", ascii_command))
 
-    # Đăng ký Photo Handler — bắt ảnh trước khi URL handler
     application.add_handler(
-        MessageHandler(filters.PHOTO, handle_photo)
+        MessageHandler(
+            (filters.TEXT | filters.Caption) & ~filters.COMMAND,
+            handle_video_url,
+        ),
+        group=0,
     )
-
-    # Đăng ký Message Handler bắt link HTTP/HTTPS
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video_url)
+        MessageHandler(filters.PHOTO, handle_photo),
+        group=1,
     )
 
     # Đăng ký Global Error Handler

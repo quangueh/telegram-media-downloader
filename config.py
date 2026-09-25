@@ -56,7 +56,7 @@ logging.basicConfig(
 logger = logging.getLogger("telegram-media-downloader")
 
 # Token của Telegram Bot
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
 if not BOT_TOKEN:
     logger.warning(
         "[CẢNH BÁO] Biến môi trường BOT_TOKEN chưa được thiết lập! "
@@ -77,6 +77,7 @@ MAX_VIDEO_DURATION = _env_int("MAX_VIDEO_DURATION", 600, 10, 3600)
 MAX_CONCURRENT_JOBS = _env_int("MAX_CONCURRENT_JOBS", 2, 1, 8)
 USER_RATE_LIMIT_SECONDS = _env_int("USER_RATE_LIMIT_SECONDS", 5, 0, 300)
 MAX_TEXT_LENGTH = _env_int("MAX_TEXT_LENGTH", 500, 32, 2000)
+URL_VALIDATION_TIMEOUT = _env_int("URL_VALIDATION_TIMEOUT", 8, 2, 30)
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", str(BASE_DIR / "downloads"))).expanduser()
