@@ -110,6 +110,21 @@ def _check_output_file(path: str, max_bytes: int, label: str) -> None:
         raise MediaFileTooLargeError(size, max_bytes, label)
 
 
+def _format_media_size(size: int) -> str:
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    return f"{max(0, size) / 1024:.0f} KB"
+
+
+def _format_media_duration(seconds: int) -> str:
+    total = max(0, int(seconds or 0))
+    minutes, secs = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
 def _request_allowed(user_id: int) -> bool:
     if USER_RATE_LIMIT_SECONDS <= 0:
         return True
@@ -433,8 +448,8 @@ async def _process_gif(reply_msg, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         progress = TelegramProgress(
             context, chat_id,
-            initial_text="🎞️ <b>Đang chuyển video → GIF...</b>",
-            title="🎞️ GIF Maker",
+            initial_text="Đang chuyển video sang GIF",
+            title="🎞️ GIF MAKER",
         )
         await progress._create_task
         video = reply_msg.video
@@ -738,7 +753,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         }
         progress = TelegramProgress(
             context, chat_id,
-            initial_text=f"<b>{mode_descriptions.get(mode, 'Đang xử lý...')}</b>",
+            initial_text=mode_descriptions.get(mode, "Đang xử lý"),
+            title="🛠️ IMAGE STUDIO",
         )
         await progress._create_task
 
@@ -901,8 +917,8 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         progress = TelegramProgress(
             context, chat_id,
-            initial_text="⏳ <b>Đã nhận link, đang kiểm tra...</b>",
-            title="🎬 Đang xử lý",
+            initial_text="Đã nhận link, đang kiểm tra",
+            title="🎬 MEDIA DOWNLOADER",
         )
         try:
             await asyncio.wait_for(progress._create_task, timeout=10)
@@ -979,7 +995,8 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         platform = "Facebook"
     else:
         platform = "Other"
-    progress.title = f"🎬 {platform}"
+    await progress.configure(f"🎬 {platform}", source=host)
+    await progress.set_stage("Đang lấy thông tin video", "Đang phân tích nguồn media...")
 
     try:
         try:
@@ -1006,6 +1023,8 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if len(safe_title) > 900:
             safe_title = safe_title[:900] + "..."
         caption = f"🎬 <b>{safe_title}</b>"
+        if duration > 0:
+            caption += f"\n⏱ <code>{_format_media_duration(duration)}</code>"
 
         # ── TikTok PHOTO POST: gửi album ảnh ──
         if result.kind == "photos":
@@ -1013,10 +1032,12 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 raise VideoDownloadError("Album vượt quá số lượng ảnh được phép.")
             for path in result.paths:
                 _check_output_file(path, MAX_PHOTO_FILE_SIZE, "Ảnh")
-            try:
-                await progress.finish("🖼️ <b>Đang tải ảnh lên Telegram...</b>")
-            except Exception:
-                pass
+            photo_size = sum(os.path.getsize(path) for path in result.paths)
+            await progress.set_stage(
+                "Đang gửi album lên Telegram",
+                f"{len(result.paths)} ảnh • {_format_media_size(photo_size)}",
+                pct=100,
+            )
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
             for batch_start in range(0, len(result.paths), 10):
                 batch_paths = result.paths[batch_start:batch_start + 10]
@@ -1063,10 +1084,12 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     os.path.getsize(video_path) if os.path.isfile(video_path) else MAX_FILE_SIZE + 1,
                     MAX_FILE_SIZE, "Video",
                 )
-            try:
-                await progress.finish("🚀 <b>Đang tải video lên Telegram...</b>")
-            except Exception:
-                pass
+            video_size = os.path.getsize(video_path)
+            await progress.set_stage(
+                "Đang gửi video lên Telegram",
+                f"{_format_media_size(video_size)} • {_format_media_duration(duration)}",
+                pct=100,
+            )
             with open(video_path, "rb") as video_file:
                 await context.bot.send_video(
                     chat_id=chat_id,
@@ -1079,11 +1102,16 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     write_timeout=REQUEST_TIMEOUT,
                 )
 
-        # Xóa tin nhắn trạng thái sau khi gửi thành công
-        try:
-            await progress.delete()
-        except Exception:
-            pass
+        if result.kind == "photos":
+            await progress.complete(
+                "Đã gửi album thành công",
+                f"{len(result.paths)} ảnh • {_format_media_size(photo_size)}",
+            )
+        else:
+            await progress.complete(
+                "Đã gửi video thành công",
+                f"{_format_media_size(video_size)} • {_format_media_duration(duration)}",
+            )
 
         # Ghi log thành công
         _log_activity(

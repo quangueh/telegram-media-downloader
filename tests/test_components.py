@@ -18,6 +18,7 @@ import yt_dlp
 from config import MAX_FILE_SIZE, DOWNLOAD_DIR
 from security import InvalidURL, redact_url, validate_public_url
 from bot import _extract_url_from_message
+from progress import _format_duration, _render_bar, _render_progress_message
 from downloader import (
     VideoTooLargeError,
     VideoDownloadError,
@@ -128,6 +129,28 @@ class TestDownloaderComponents(unittest.TestCase):
             self.assertEqual(resp.status, 200)
             data = resp.read().decode("utf-8")
             self.assertIn("running OK", data)
+
+
+class TestProgressUI(unittest.TestCase):
+    def test_progress_bar_and_duration(self):
+        self.assertIn("50%", _render_bar(50))
+        self.assertEqual(_render_bar(50).count("▰"), 6)
+        self.assertEqual(_format_duration(65), "1m 05s")
+
+    def test_progress_message_escapes_content_and_eta(self):
+        message = _render_progress_message(
+            "🎬 YouTube",
+            "Đang tải video",
+            "<script>3.2 / 10 MB — 1.4 MB/s</script>",
+            pct=32,
+            source="youtu.be",
+            elapsed=20,
+        )
+        self.assertIn("<b>🎬 YOUTUBE</b>", message)
+        self.assertIn("ETA 42s", message)
+        self.assertIn("youtu.be", message)
+        self.assertNotIn("<script>", message)
+        self.assertIn("3.2 / 10 MB", message)
 
 
 class TestPlayableCompatibility(unittest.TestCase):
