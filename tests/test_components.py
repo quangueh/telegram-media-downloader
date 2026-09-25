@@ -487,6 +487,11 @@ class TestYtdlpOptsAttempts(unittest.TestCase):
         self.assertIsInstance(opts0["extractor_args"]["youtube"]["player_client"], list)
         # attempt 1: fallback default,-web (kỹ thuật VidBee cho IP datacenter)
         self.assertEqual(opts1["extractor_args"]["youtube"]["player_client"], "default,-web")
+        opts2 = _build_ytdlp_opts(base, Path(tempfile.gettempdir()), "uid", attempt=2)
+        self.assertEqual(opts2["extractor_args"]["youtube"]["player_client"], "android_vr")
+        self.assertIn("media_uid.%(ext)s", opts0["outtmpl"])
+        self.assertNotIn("%(title)s", opts0["outtmpl"])
+        self.assertTrue(opts0["windowsfilenames"])
         # cả 2 vẫn ưu tiên H.264 + AAC
         self.assertIn("vcodec^=avc1", opts0["format"])
         self.assertIn("vcodec^=avc1", opts1["format"])

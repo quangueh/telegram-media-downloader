@@ -597,9 +597,10 @@ def _build_ytdlp_opts(
     """Xây dựng ydl_opts cho yt-dlp, tối ưu theo nền tảng.
 
     attempt=0: giới hạn player clients đã biết (tránh PO token).
-    attempt=1: client mặc định của yt-dlp (fallback khi các client giới hạn bị chặn).
+    attempt=1: client mặc định của yt-dlp.
+    attempt=2: android_vr fallback cho IP bị chặn.
     """
-    outtmpl = str(target_dir / f"{_safe_filename('%(title)s', unique_id)}_{unique_id}.%(ext)s")
+    outtmpl = str(target_dir / f"media_{unique_id}.%(ext)s")
 
     # Ưu tiên H.264 + AAC trong mp4 — tương thích mọi thiết bị / Telegram.
     # Tránh các format "enhanced" mới của YouTube (VP9/AV1/HEVC nhét trong mp4,
@@ -615,6 +616,7 @@ def _build_ytdlp_opts(
         "max_filesize": MAX_FILE_SIZE,
         "quiet": True,
         "no_warnings": True,
+        "windowsfilenames": True,
         "noplaylist": True,
         "postprocessor_args": ["-movflags", "+faststart"],
         # Fast-fail: tránh yt-dlp retry mặc định 10 lần → treo hàng phút khi bị chặn
@@ -649,12 +651,15 @@ def _build_ytdlp_opts(
                     "player_skip": ["js"],
                 }
             }
-        else:
-            # attempt 2: default,-web — bỏ client `web` (PO-token gated hay 403),
-            # giữ các client khác làm fallback (kỹ thuật VidBee cho IP datacenter)
+        elif attempt == 1:
             logger.info("YouTube: dùng player clients default,-web (attempt 2)")
             opts["extractor_args"] = {
                 "youtube": {"player_client": YOUTUBE_CLIENTS_FALLBACK}
+            }
+        else:
+            logger.info("YouTube: dùng player client android_vr (attempt 3)")
+            opts["extractor_args"] = {
+                "youtube": {"player_client": "android_vr"}
             }
 
     # Cookies theo platform (giúp tải từ IP datacenter bị chặn)
@@ -704,9 +709,8 @@ def _sync_ytdlp_download(
 
     logger.info("yt-dlp đang xử lý: %s", redact_url(url))
 
-    # Retry tối đa 2 lần cho YouTube: lần 1 dùng player clients đã biết,
-    # lần 2 dùng client mặc định của yt-dlp (nếu lần 1 bị chặn).
-    for attempt in range(2):
+    # YouTube thử tối đa 3 player client trước khi chuyển backend khác.
+    for attempt in range(3):
         cookie_files: list[Path] = []
         opts = _build_ytdlp_opts(
             url, target_dir, unique_id, progress_cb, attempt=attempt,
@@ -775,21 +779,27 @@ def _sync_ytdlp_download(
                 return final_file, title, duration
         except yt_dlp.utils.DownloadError as e:
             msg = _clean_error(e)
-            if attempt == 0 and _is_youtube_url(url):
-                # IP bị YouTube chặn thật (player response) + chưa có cookies
-                # → fail nhanh kèm hướng dẫn, không grind client vô ích 150s
-                cookies_set = bool(os.getenv("YOUTUBE_COOKIES", "").strip())
-                if _is_youtube_blocked(msg) and not cookies_set:
-                    raise VideoDownloadError(
-                        "YouTube chặn IP máy chủ (không lấy được player response).\n"
-                        "Hãy cấu hình YOUTUBE_COOKIES (cookie Netscape format từ trình "
-                        "duyệt đã đăng nhập YouTube) trong biến môi trường để tải được."
-                    ) from e
+            is_youtube = _is_youtube_url(url)
+            cookies_set = bool(os.getenv("YOUTUBE_COOKIES", "").strip())
+            if is_youtube and attempt < 2:
                 _cleanup_leftovers(target_dir, unique_id)
-                logger.warning(
-                    f"yt-dlp attempt 1 fail ({msg[:120]}) — thử client mặc định..."
-                )
+                if _is_youtube_blocked(msg) and not cookies_set:
+                    logger.warning(
+                        "YouTube attempt %s bị chặn: %s — thử client khác",
+                        attempt + 1, msg[:160],
+                    )
+                else:
+                    logger.warning(
+                        "yt-dlp attempt %s fail: %s — thử client khác",
+                        attempt + 1, msg[:160],
+                    )
                 continue
+            if is_youtube and _is_youtube_blocked(msg) and not cookies_set:
+                raise VideoDownloadError(
+                    "YouTube bị chặn IP máy chủ sau khi thử các player client.\n"
+                    "Hãy cấu hình YOUTUBE_COOKIES (cookie Netscape từ trình duyệt "
+                    "đã đăng nhập) hoặc thử lại sau."
+                ) from e
             raise VideoDownloadError(msg) from e
         finally:
             for cookie_path in cookie_files:
