@@ -549,6 +549,10 @@ class TestYtdlpOptsAttempts(unittest.TestCase):
             opts["extractor_args"]["youtubepot-bgutilhttp"]["base_url"],
             "http://pot.example:4416",
         )
+        self.assertEqual(
+            opts["extractor_args"]["youtube"]["player_client"],
+            ["mweb", "tv", "web_safari"],
+        )
 
 
 class TestRunExecutor(unittest.TestCase):

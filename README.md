@@ -105,6 +105,7 @@ telegram-media-downloader/
    YOUTUBE_PROXY=http://user:password@proxy-host:port
    YOUTUBE_POT_PROVIDER_URL=http://provider-host:4416
    ```
+   Provider và yt-dlp nên dùng cùng IP egress; token bị ràng buộc theo phiên/video.
    `YOUTUBE_COOKIES`/`YOUTUBE_COOKIES_B64` vẫn được hỗ trợ cho trường hợp tự chịu rủi ro, nhưng không nên dùng cookie tài khoản Google chính vì YouTube có thể khóa tài khoản. `TIKTOK_COOKIES` dùng cho cookie TikTok.
 
 

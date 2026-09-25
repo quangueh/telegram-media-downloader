@@ -57,6 +57,7 @@ YOUTUBE_ID_PATTERN = re.compile(
 
 # Player client YouTube không yêu cầu PO Token (thứ tự ưu tiên theo test 2026-09-05)
 YOUTUBE_PLAYER_CLIENTS = ["visionos", "android_vr", "android", "tv_embedded", "android_music", "mweb_safari"]
+YOUTUBE_POT_PLAYER_CLIENTS = ["mweb", "tv", "web_safari"]
 
 # Attempt 2: bỏ client `web` (bị PO-token chặn hay 403), giữ các client còn lại
 # (kỹ thuật từ VidBee — hoạt động tốt trên IP datacenter)
@@ -672,9 +673,14 @@ def _build_ytdlp_opts(
             "best[ext=mp4]/best"
         )
         if attempt == 0:
+            player_clients = (
+                YOUTUBE_POT_PLAYER_CLIENTS
+                if os.getenv("YOUTUBE_POT_PROVIDER_URL", "").strip()
+                else YOUTUBE_PLAYER_CLIENTS
+            )
             opts["extractor_args"] = {
                 "youtube": {
-                    "player_client": YOUTUBE_PLAYER_CLIENTS,
+                    "player_client": player_clients,
                     "player_skip": ["js"],
                 }
             }
@@ -1574,7 +1580,7 @@ async def _extract_and_download_impl(
         hint = (
             "\n\n💡 <b>IP máy chủ đang bị YouTube chặn.</b> Cách khắc phục:\n"
             "1️⃣ Ưu tiên proxy sạch/residential qua <code>YOUTUBE_PROXY</code>.\n"
-            "2️⃣ Hoặc kết nối <code>YOUTUBE_POT_PROVIDER_URL</code> tới PO-token provider.\n"
+            "2️⃣ Hoặc kết nối <code>YOUTUBE_POT_PROVIDER_URL</code> tới provider dùng cùng IP egress.\n"
             "⚠️ Không nên dùng cookie tài khoản Google chính; YouTube có thể khóa tài khoản."
         )
         raise VideoDownloadError(
