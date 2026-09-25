@@ -103,6 +103,7 @@ telegram-media-downloader/
 5. *(Tùy chọn — chỉ dùng khi server bị chặn)* Không gửi cookie vào log hoặc commit. Lưu nội dung Netscape trong secret manager / biến môi trường của deployment:
    ```env
    YOUTUBE_COOKIES=<nội dung cookies.txt của YouTube>
+   YOUTUBE_COOKIES_B64=<nội dung cookies.txt mã hóa Base64, dùng thay biến trên>
    TIKTOK_COOKIES=<nội dung cookies.txt của TikTok>
    ```
    Bot tạo file cookie tạm riêng, giới hạn quyền truy cập và xóa sau mỗi lần tải.

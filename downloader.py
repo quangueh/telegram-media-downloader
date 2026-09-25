@@ -2,6 +2,8 @@
 
 import os
 import re
+import base64
+import binascii
 import json
 import time
 import uuid
@@ -163,6 +165,21 @@ def _load_cookies(
     temporary_files: Optional[list[Path]] = None,
 ) -> None:
     cookies_str = os.getenv(env_name, "").strip()
+    source_env = env_name
+    encoded_env = f"{env_name}_B64"
+    if not cookies_str:
+        encoded = os.getenv(encoded_env, "").strip()
+        if encoded:
+            try:
+                decoded = base64.b64decode(encoded, validate=True)
+                if len(decoded) > 2 * 1024 * 1024:
+                    raise ValueError(f"{encoded_env} vượt quá giới hạn kích thước")
+                cookies_str = decoded.decode("utf-8")
+                source_env = encoded_env
+            except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+                raise ValueError(
+                    f"{encoded_env} không hợp lệ; cần base64 của cookies.txt"
+                ) from exc
     if not cookies_str:
         return
     if os.path.isfile(cookies_str):
@@ -183,7 +200,7 @@ def _load_cookies(
     except OSError:
         pass
     opts["cookiefile"] = str(cookie_path)
-    logger.info(f"{label} cookies loaded từ {env_name}.")
+    logger.info(f"{label} cookies loaded từ {source_env}.")
 
 
 def _is_youtube_url(url: str) -> bool:
@@ -780,7 +797,10 @@ def _sync_ytdlp_download(
         except yt_dlp.utils.DownloadError as e:
             msg = _clean_error(e)
             is_youtube = _is_youtube_url(url)
-            cookies_set = bool(os.getenv("YOUTUBE_COOKIES", "").strip())
+            cookies_set = bool(
+                os.getenv("YOUTUBE_COOKIES", "").strip()
+                or os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+            )
             if is_youtube and attempt < 2:
                 _cleanup_leftovers(target_dir, unique_id)
                 if _is_youtube_blocked(msg) and not cookies_set:
@@ -1536,8 +1556,8 @@ async def _extract_and_download_impl(
 
         hint = (
             "\n\n💡 <b>IP máy chủ đang bị YouTube chặn.</b> Cách khắc phục:\n"
-            "1️⃣ Đặt <code>YOUTUBE_COOKIES</code> (cookie Netscape format từ trình duyệt "
-            "đã đăng nhập YouTube) vào biến môi trường — hiệu quả nhất.\n"
+            "1️⃣ Đặt <code>YOUTUBE_COOKIES</code> (hoặc <code>YOUTUBE_COOKIES_B64</code>) "
+            "với cookie Netscape từ trình duyệt đã đăng nhập YouTube — hiệu quả nhất.\n"
             "2️⃣ Chạy PO-token server (<code>bgutil-ytdlp-pot-provider</code>) cạnh bot."
         )
         raise VideoDownloadError(

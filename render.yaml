@@ -25,6 +25,8 @@ services:
         value: "8"
       - key: YOUTUBE_COOKIES
         value: ""
+      - key: YOUTUBE_COOKIES_B64
+        sync: false
       - key: TIKTOK_COOKIES
         value: ""
       - key: ADMIN_USER_ID

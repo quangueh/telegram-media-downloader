@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import base64
 import shutil
 import subprocess
 import unittest
@@ -439,10 +440,26 @@ class TestPlatformDetection(unittest.TestCase):
         self.assertEqual(temporary_files, [cookie_path])
         cookie_path.unlink()
 
+    def test_load_cookies_decodes_base64(self):
+        opts = {}
+        temporary_files = []
+        encoded = base64.b64encode(b"# Netscape\nyoutube.com\tTRUE\t/\tTRUE\t0\tname\tvalue\n").decode()
+        with mock.patch.dict(
+            os.environ,
+            {"YOUTUBE_COOKIES": "", "YOUTUBE_COOKIES_B64": encoded},
+            clear=False,
+        ):
+            _load_cookies(opts, "YOUTUBE_COOKIES", "YouTube", temporary_files)
+        cookie_path = Path(opts["cookiefile"])
+        self.assertTrue(cookie_path.exists())
+        self.assertIn("youtube.com", cookie_path.read_text(encoding="utf-8"))
+        cookie_path.unlink()
+
     def test_load_cookies_empty(self):
         opts = {}
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("YOUTUBE_COOKIES", None)
+            os.environ.pop("YOUTUBE_COOKIES_B64", None)
             _load_cookies(opts, "YOUTUBE_COOKIES", "YouTube")
         self.assertNotIn("cookiefile", opts)
 

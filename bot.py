@@ -1181,7 +1181,10 @@ def log_build_info() -> None:
         except Exception:
             commit = "unknown (no git in container)"
 
-    cookies_configured = bool(os.getenv("YOUTUBE_COOKIES", "").strip())
+    cookies_configured = bool(
+        os.getenv("YOUTUBE_COOKIES", "").strip()
+        or os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+    )
     logger.info(
         f"BUILD INFO — commit: {commit} | yt-dlp: {yt_dlp.version.__version__} | "
         f"YT player clients: {YOUTUBE_PLAYER_CLIENTS} | "
