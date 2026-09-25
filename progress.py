@@ -17,6 +17,7 @@ Callback on_progress cho downloader:
 
 import asyncio
 import html
+import threading
 import time
 from typing import Optional
 
@@ -50,6 +51,8 @@ class TelegramProgress:
         # Capture event loop TẠI THỜI ĐIỂM TẠO (chạy trong async context)
         # → update_sync từ executor thread dùng loop này
         self._loop = asyncio.get_running_loop()
+        self._update_lock = threading.Lock()
+        self._update_scheduled = False
         self._create_task = asyncio.create_task(self._send(initial_text))
 
     async def _send(self, text: str) -> None:
@@ -96,7 +99,7 @@ class TelegramProgress:
 
     async def fail(self, text: str) -> None:
         """Edit lần cuối khi lỗi (HTML text)."""
-        if self._finished or self._message is None:
+        if self._message is None:
             return
         self._finished = True
         try:
@@ -114,18 +117,32 @@ class TelegramProgress:
         except Exception:
             pass
 
+    async def _update_from_sync(
+        self, pct: Optional[float], text: Optional[str]
+    ) -> None:
+        try:
+            await self.update(pct, text)
+        finally:
+            with self._update_lock:
+                self._update_scheduled = False
+
     def update_sync(self, pct: Optional[float], text: Optional[str] = None) -> None:
-        """Callback chạy từ thread executor — schedule update về event loop chính."""
+        with self._update_lock:
+            if self._update_scheduled:
+                return
+            self._update_scheduled = True
         try:
             asyncio.run_coroutine_threadsafe(
-                self.update(pct, text), self._loop
+                self._update_from_sync(pct, text), self._loop
             )
         except Exception:
-            pass  # loop đã đóng (bot đang shutdown) — bỏ qua
+            with self._update_lock:
+                self._update_scheduled = False
 
 
 def _render_bar(pct: float, width: int = 10) -> str:
     """Render progress bar 10 ký tự: ▰▰▰▱▱▱▱▱▱▱ 45%"""
+    pct = max(0.0, min(100.0, float(pct)))
     filled = int(pct * width / 100)
     bar = "▰" * filled + "▱" * (width - filled)
     return f"{bar} {pct:.0f}%"

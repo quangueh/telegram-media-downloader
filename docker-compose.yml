@@ -5,13 +5,25 @@ services:
       dockerfile: Dockerfile
     container_name: telegram-media-downloader
     restart: unless-stopped
+    init: true
+    user: "10001:10001"
     env_file:
       - .env
     environment:
-      - PYTHONUNBUFFERED=1
-    volumes:
-      # Giữ thư mục downloads tạm thời trong container hoặc map ra ngoài nếu cần debug
-      - temp-downloads:/app/downloads
-
-volumes:
-  temp-downloads:
+      PYTHONUNBUFFERED: "1"
+      PORT: "${PORT:-8080}"
+      DOWNLOAD_DIR: /app/downloads
+      MAX_CONCURRENT_JOBS: "${MAX_CONCURRENT_JOBS:-2}"
+      USER_RATE_LIMIT_SECONDS: "${USER_RATE_LIMIT_SECONDS:-5}"
+      MAX_VIDEO_DURATION: "${MAX_VIDEO_DURATION:-600}"
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+      - /app/downloads:rw,noexec,nosuid,size=512m,uid=10001,gid=10001,mode=0700
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true

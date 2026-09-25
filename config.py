@@ -2,6 +2,23 @@ import os
 import sys
 import logging
 from pathlib import Path
+
+
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(value, maximum))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -47,17 +64,28 @@ if not BOT_TOKEN:
         "Hãy tạo file .env hoặc export BOT_TOKEN=<your_token>."
     )
 
-# Giới hạn dung lượng tệp tin (Telegram Bot API tiêu chuẩn cho phép gửi tối đa 50MB)
-# Đặt ngưỡng an toàn là 49MB để tránh lỗi biên độ
-MAX_FILE_SIZE = 49 * 1024 * 1024  # 49 MB tính theo bytes
+MAX_FILE_SIZE_MB = _env_int("MAX_FILE_SIZE_MB", 49, 1, 50)
+MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
+MAX_PHOTO_FILE_SIZE = _env_int("MAX_PHOTO_FILE_SIZE_MB", 10, 1, 10) * 1024 * 1024
+MAX_AUDIO_FILE_SIZE = _env_int("MAX_AUDIO_FILE_SIZE_MB", 49, 1, 49) * 1024 * 1024
+MAX_IMAGE_FILE_SIZE = _env_int("MAX_IMAGE_FILE_SIZE_MB", 20, 1, 50) * 1024 * 1024
+MAX_IMAGE_PIXELS = _env_int("MAX_IMAGE_PIXELS", 25_000_000, 1_000_000, 100_000_000)
+MAX_IMAGE_DIMENSION = _env_int("MAX_IMAGE_DIMENSION", 4096, 256, 8192)
+MAX_PHOTO_COUNT = _env_int("MAX_PHOTO_COUNT", 30, 1, 50)
+MAX_ALBUM_DURATION = _env_int("MAX_ALBUM_DURATION", 180, 10, 600)
+MAX_VIDEO_DURATION = _env_int("MAX_VIDEO_DURATION", 600, 10, 3600)
+MAX_CONCURRENT_JOBS = _env_int("MAX_CONCURRENT_JOBS", 2, 1, 8)
+USER_RATE_LIMIT_SECONDS = _env_int("USER_RATE_LIMIT_SECONDS", 5, 0, 300)
+MAX_TEXT_LENGTH = _env_int("MAX_TEXT_LENGTH", 500, 32, 2000)
 
-# Thư mục chứa các tệp tải về tạm thời
 BASE_DIR = Path(__file__).resolve().parent
-DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", BASE_DIR / "downloads"))
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", str(BASE_DIR / "downloads"))).expanduser()
+try:
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    DOWNLOAD_DIR = BASE_DIR / "downloads"
 
-# Timeout cấu hình cho Telegram upload (giây)
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "180"))
-
-# Cổng mạng phục vụ Health Check (tự động nhận diện trên Render / Cloud Web Service)
-PORT = int(os.getenv("PORT", "0"))
+REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 180, 30, 600)
+PORT = _env_int("PORT", 0, 0, 65535)
+ADMIN_USER_ID = _env_int("ADMIN_USER_ID", 0, 0, 2**63 - 1)
+ALLOW_PRIVATE_URLS = _env_bool("ALLOW_PRIVATE_URLS", False)

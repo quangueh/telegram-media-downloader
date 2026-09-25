@@ -5,21 +5,35 @@ Chức năng:
   - enhance_image(): làm nét — sharpen + denoise + saturation boost
   - beautify_image(): làm đẹp — mịn da + sáng + ấm + hồng
 
-Yêu cầu: Pillow>=10.0, numpy>=1.24
+Yêu cầu: Pillow>=10.0
 """
 
 from typing import Callable, Optional
 
-import numpy as np
-from PIL import Image, ImageFilter, ImageEnhance
+from PIL import Image, ImageFilter, ImageEnhance, ImageOps
+
+from config import MAX_IMAGE_DIMENSION, MAX_IMAGE_PIXELS
 
 
-# Kích thước tối đa output (giữ RAM thấp trên Render free tier)
-MAX_DIMENSION = 4096
+MAX_DIMENSION = MAX_IMAGE_DIMENSION
 JPEG_QUALITY = 95
 
 # Kiểu callback: on_step(pct: float, text: str)
 StepCB = Optional[Callable[[float, str], None]]
+
+
+def open_safe_image(input_path: str) -> Image.Image:
+    with Image.open(input_path) as source:
+        width, height = source.size
+        if width < 1 or height < 1:
+            raise ValueError("Kích thước ảnh không hợp lệ.")
+        if width * height > MAX_IMAGE_PIXELS:
+            raise ValueError("Ảnh có số lượng pixel vượt quá giới hạn.")
+        if max(width, height) > MAX_IMAGE_DIMENSION * 2:
+            raise ValueError("Kích thước ảnh vượt quá giới hạn.")
+        source.seek(0)
+        image = source.copy()
+    return ImageOps.exif_transpose(image)
 
 
 def _resize_if_needed(img: Image.Image) -> Image.Image:
@@ -33,13 +47,11 @@ def _resize_if_needed(img: Image.Image) -> Image.Image:
 
 
 def _add_pink_tone(img: Image.Image, amount: int = 8) -> Image.Image:
-    """Thêm tông hồng/ấm nhẹ bằng cách điều chỉnh kênh RGB."""
-    arr = np.array(img, dtype=np.int16)
-    # R +amount, G +amount//2, B -amount → tông hồng ấm
-    arr[:, :, 0] = np.clip(arr[:, :, 0] + amount, 0, 255)
-    arr[:, :, 1] = np.clip(arr[:, :, 1] + amount // 2, 0, 255)
-    arr[:, :, 2] = np.clip(arr[:, :, 2] - amount, 0, 255)
-    return Image.fromarray(arr.astype(np.uint8))
+    red, green, blue = img.split()
+    red = red.point(lambda value: min(255, value + amount))
+    green = green.point(lambda value: min(255, value + amount // 2))
+    blue = blue.point(lambda value: max(0, value - amount))
+    return Image.merge("RGB", (red, green, blue))
 
 
 def enhance_image(input_path: str, output_path: str, on_step: StepCB = None) -> str:
@@ -59,7 +71,7 @@ def enhance_image(input_path: str, output_path: str, on_step: StepCB = None) -> 
                 pass
 
     report(5, "📥 Đang đọc ảnh...")
-    img = Image.open(input_path).convert("RGB")
+    img = open_safe_image(input_path).convert("RGB")
     img = _resize_if_needed(img)
 
     # Bước 1: Denoise nhẹ — loại bỏ noise trước khi sharpen
@@ -102,7 +114,7 @@ def beautify_image(input_path: str, output_path: str, on_step: StepCB = None) ->
                 pass
 
     report(5, "📥 Đang đọc ảnh...")
-    img = Image.open(input_path).convert("RGB")
+    img = open_safe_image(input_path).convert("RGB")
     img = _resize_if_needed(img)
 
     # Bước 1: Mịn da nhẹ — GaussianBlur radius=1 giữ chi tiết

@@ -1,19 +1,21 @@
 # 🚀 Telegram Media Downloader Bot
 
-Bot Telegram chuyên dụng tải video chất lượng cao, **không dính watermark / logo** từ các nền tảng phổ biến (**TikTok**, **Facebook**, **YouTube**) được xây dựng bằng Python, `yt-dlp` và `python-telegram-bot` v20+ (async/await).
+Bot Telegram chuyên dụng tải video chất lượng cao từ các nền tảng phổ biến (**TikTok**, **Facebook**, **YouTube**, **Douyin**) được xây dựng bằng Python, `yt-dlp` và `python-telegram-bot` v22+ (async/await).
 
 ---
 
 ## 🌟 Tính Năng Nổi Bật
 
-- 🎵 **TikTok No-Watermark:** Tự động phát hiện và trích xuất luồng video gốc không logo / watermark từ TikTok (kể cả bài đăng ảnh → gửi album ảnh).
+- 🎵 **TikTok:** Tự động phát hiện link video/photo post và chọn nguồn stream phù hợp; khả năng bỏ watermark phụ thuộc nguồn gốc.
 - 🇨🇳 **Douyin:** Hỗ trợ link Douyin (v.douyin.com / www.douyin.com) qua yt-dlp.
 - 📘 **Facebook HD:** Tải video Facebook với độ phân giải cao nhất (SD/HD).
 - 📺 **YouTube Full Audio & Video:** Tự động hợp nhất video và audio chất lượng cao nhất bằng FFmpeg sang định dạng MP4 chuẩn (H.264 + AAC, phát được mọi thiết bị).
-- ⚡ **Xử lý Bất đồng bộ (Async/Await):** Không block bot event loop khi xử lý nhiều người dùng cùng lúc (`asyncio.to_thread`).
-- 🛡️ **Kiểm soát dung lượng an toàn (Telegram 50MB Limit):** Bắt và xử lý lỗi tệp vượt quá 50MB rõ ràng, không gây crash bot.
-- 🧹 **Tự động dọn dẹp (Storage Cleanup):** Khối `finally` đảm bảo xóa file tạm thời trên ổ cứng ngay sau khi gửi hoặc khi phát sinh lỗi.
-- 🐳 **Dockerized:** Đã kèm `Dockerfile` và `docker-compose.yml` tối ưu hóa, sẵn sàng deploy lên Koyeb, VPS, Railway.
+- ⚡ **Xử lý bất đồng bộ:** HTTP, FFmpeg, xử lý ảnh và yt-dlp không chặn event loop; có giới hạn số job đồng thời và rate-limit Telegram.
+- 🛡️ **An toàn URL:** Chặn SSRF, mạng nội bộ, metadata endpoint, URL không hợp lệ và kiểm tra lại từng redirect.
+- 📦 **Giới hạn tài nguyên:** Giới hạn dung lượng video/ảnh/audio, số ảnh album, thời lượng video, pixel ảnh và kích thước input.
+- 🧹 **Dọn dẹp theo job:** Mỗi request dùng thư mục tạm riêng, tự xóa cả file, cookie tạm và thư mục con khi thành công hoặc lỗi.
+- 🎞️ **Tương thích phát:** FFmpeg chuẩn hóa H.264/AAC, xử lý tiến trình an toàn và chọn stream tốt nhất còn vừa giới hạn.
+- 🩺 **Vận hành sẵn sàng:** Health-check liveness/readiness, Docker chạy non-root, có resource limit và CI lint/test/build.
 
 ---
 
@@ -25,15 +27,21 @@ telegram-media-downloader/
 │   └── ci-cd.yml
 ├── render.yaml           # Cấu hình tự động triển khai lên Render.com (Blueprint)
 ├── koyeb.yaml            # Cấu hình triển khai tự động lên Koyeb PaaS
-├── config.py             # Quản lý cấu hình, biến môi trường, dung lượng tối đa
-├── downloader.py         # Module cốt lõi yt-dlp & FFmpeg xử lý trích xuất/tải
-├── bot.py                # Điểm khởi chạy (Entrypoint), quản lý các handlers của Telegram
-├── requirements.txt      # Danh sách thư viện Python cần thiết
-├── Dockerfile            # Cấu hình container Python 3.11 + FFmpeg
-├── docker-compose.yml    # File compose để khởi chạy nhanh trên local / server
+├── config.py             # Cấu hình, giới hạn tài nguyên và biến môi trường
+├── security.py           # Validate URL công khai, chặn SSRF và redacts URL
+├── downloader.py         # Router yt-dlp/API/FFmpeg, job temp và giới hạn media
+├── image_processor.py    # Xử lý ảnh an toàn theo pixel/dimension
+├── tools.py              # QR, sticker, GIF, meme, nén ảnh, màu, thumbnail
+├── progress.py           # Progress message Telegram có throttle
+├── bot.py                # Entrypoint, handlers, limiter, health-check
+├── tests/                # Unit test cho security, downloader và media tools
+├── requirements.txt      # Dependency runtime có giới hạn phiên bản
+├── pyproject.toml        # Cấu hình Ruff
+├── Dockerfile            # Container non-root + FFmpeg + healthcheck
+├── docker-compose.yml    # Chạy local với resource limit
 ├── .env.example          # Mẫu biến môi trường
-├── .gitignore            # Bỏ qua file nhạy cảm và file tạm thời
-└── README.md             # Hướng dẫn chi tiết
+├── .gitignore            # Bỏ qua secret, cache và file tạm
+└── README.md             # Hướng dẫn vận hành
 ```
 
 ---
@@ -92,13 +100,13 @@ telegram-media-downloader/
     LOG_LEVEL=INFO
     ```
 
-5. *(Tùy chọn — quan trọng khi chạy trên server/IP datacenter)* Thêm cookies để tải
-   YouTube / TikTok / Douyin không bị chặn. Dùng extension **"Get cookies.txt LOCALLY"**
-   xuất cookies (Netscape format) từ trình duyệt đã đăng nhập, rồi dán vào biến môi trường:
-    ```env
-    YOUTUBE_COOKIES=<nội dung cookies.txt của YouTube>
-    TIKTOK_COOKIES=<nội dung cookies.txt của TikTok>
-    ```
+5. *(Tùy chọn — chỉ dùng khi server bị chặn)* Không gửi cookie vào log hoặc commit. Lưu nội dung Netscape trong secret manager / biến môi trường của deployment:
+   ```env
+   YOUTUBE_COOKIES=<nội dung cookies.txt của YouTube>
+   TIKTOK_COOKIES=<nội dung cookies.txt của TikTok>
+   ```
+   Bot tạo file cookie tạm riêng, giới hạn quyền truy cập và xóa sau mỗi lần tải.
+
 
 6. **Khởi chạy bot:**
     ```bash
@@ -148,13 +156,13 @@ docker run -d --name telegram-downloader \
 
 ## 🟣 Hướng Dẫn Triển Khai Lên Render.com (Khuyên Dùng)
 
-Dự án đã được tối ưu hóa đặc biệt cho **Render.com** (tích hợp sẵn HTTP Health-Check server trong [bot.py](file:///d:/Tiktok_dowload/telegram-media-downloader/bot.py) để đáp ứng kiểm tra Port của Render và hỗ trợ gói **Free Tier**).
+Dự án đã được tối ưu hóa đặc biệt cho **Render.com** (tích hợp HTTP health-check trong `bot.py` để đáp ứng kiểm tra port và hỗ trợ gói Free Tier).
 
 ### Cách 1: Triển khai tự động bằng Blueprint (Nhanh nhất)
 1. Đẩy mã nguồn dự án lên GitHub repository của bạn.
 2. Đăng nhập [Render Dashboard](https://dashboard.render.com/).
 3. Nhấn **New +** -> Chọn **Blueprint**.
-4. Kết nối đến GitHub repository của bạn. Render sẽ tự động đọc file [render.yaml](file:///d:/Tiktok_dowload/telegram-media-downloader/render.yaml).
+4. Kết nối đến GitHub repository của bạn. Render sẽ tự động đọc file `render.yaml`.
 5. Render sẽ nhắc bạn nhập biến môi trường `BOT_TOKEN` -> Điền token bot của bạn.
 6. Nhấn **Apply**. Render sẽ tự động build Docker image và khởi chạy bot.
 
@@ -189,7 +197,7 @@ Dự án đã được tối ưu hóa đặc biệt cho **Render.com** (tích h�
 7. Tại mục **Instance type**, chọn cấu hình mong muốn (ví dụ gói Free Nano hoặc Micro).
 8. Nhấn **Deploy**. Koyeb sẽ tự động build image có chứa FFmpeg và chạy bot của bạn 24/7!
 
-> **Gợi ý:** Bạn cũng có thể dùng file cấu hình [koyeb.yaml](file:///d:/Tiktok_dowload/telegram-media-downloader/koyeb.yaml) đã chuẩn bị sẵn để deploy qua Koyeb CLI:
+> **Gợi ý:** Bạn cũng có thể dùng file cấu hình `koyeb.yaml` đã chuẩn bị sẵn để deploy qua Koyeb CLI:
 > ```bash
 > koyeb service create --app telegram-media-downloader --name bot --instance-type nano
 > ```
@@ -198,16 +206,18 @@ Dự án đã được tối ưu hóa đặc biệt cho **Render.com** (tích h�
 
 ## 🔄 CI/CD Pipeline (GitHub Actions)
 
-Dự án đã tích hợp sẵn workflow tại [.github/workflows/ci-cd.yml](file:///d:/Tiktok_dowload/telegram-media-downloader/.github/workflows/ci-cd.yml):
-- **Tự động chạy Unit Tests** trên mỗi lần `push` hoặc `pull_request`.
+Dự án đã tích hợp sẵn workflow tại `.github/workflows/ci-cd.yml`:
+- **Tự động chạy compile, Ruff lint và Unit Tests** trên mỗi lần `push` hoặc `pull_request`.
 - **Tự động kiểm tra Docker Build** để đảm bảo container image luôn build thành công.
-- **Tự động kích hoạt deploy** nếu có token `KOYEB_TOKEN`.
+- **Không tự động chạy lệnh deploy có side effect**; triển khai qua cấu hình Render/Koyeb hoặc pipeline riêng.
 
 ## ❓ Câu Hỏi Thường Gặp (FAQ) & Xử Lý Sự Cố
 
 - **Hỏi: Tại sao video YouTube dài hơn 20 phút không gửi được?**
   - **Đáp:** Telegram Bot API giới hạn các bot thông thường chỉ được gửi tệp tối đa 50MB. Video quá dài có dung lượng > 50MB sẽ được bot tự động thông báo lỗi mà không làm sập bot.
 - **Hỏi: Video TikTok có bị dính ID hay logo mờ không?**
-  - **Đáp:** Không. Bộ trích xuất của `yt-dlp` tự động gọi API trực tiếp đến máy chủ CDN của TikTok để lấy luồng MP4 nguyên bản không logo.
+  - **Đáp:** Tùy nguồn phát, thuật toán có thể không lấy được bản không watermark. Bot không cam kết xóa mọi watermark của nền tảng.
 - **Hỏi: Ổ cứng máy chủ có bị đầy sau nhiều lượt tải không?**
-  - **Đáp:** Không. Tất cả các file video sau khi gửi (hoặc khi gặp lỗi) đều được dọn dẹp bằng hàm `os.remove()` trong khối `finally`.
+  - **Đáp:** Mỗi job dùng thư mục tạm riêng và được dọn dẹp trong `finally`; Docker local còn giới hạn không gian tạm và số tiến trình.
+- **Hỏi: Có thể dùng URL nội bộ để test không?**
+  - **Đáp:** Mặc định bị chặn để chống SSRF. Chỉ bật `ALLOW_PRIVATE_URLS=true` trong môi trường test nội bộ, không dùng trên production.

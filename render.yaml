@@ -1,47 +1,29 @@
-# Render Blueprint Specification
-# Tài liệu tham khảo: https://render.com/docs/blueprint-spec
 services:
-  # Gói Web Service (Có thể chọn gói Free Tier)
-  # Nhờ tích hợp HTTP Health-Check server trong bot.py, Render sẽ phát hiện cổng thành công
   - type: web
     name: telegram-media-downloader
     runtime: docker
     dockerfilePath: ./Dockerfile
     plan: free
     region: singapore
+    healthCheckPath: /health
     envVars:
       - key: BOT_TOKEN
-        sync: false # Giá trị bảo mật, Render sẽ yêu cầu bạn nhập trong Dashboard khi tạo service
+        sync: false
       - key: LOG_LEVEL
         value: INFO
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: REQUEST_TIMEOUT
         value: "180"
-      # YouTube cookies (optional): paste Netscape-format cookies.txt content
-      # to bypass "Sign in to confirm you're not a bot" on Render.
-      # Leave empty: bot uses visionos/android_vr/tv clients instead.
+      - key: MAX_CONCURRENT_JOBS
+        value: "2"
+      - key: USER_RATE_LIMIT_SECONDS
+        value: "5"
+      - key: MAX_VIDEO_DURATION
+        value: "600"
       - key: YOUTUBE_COOKIES
         value: ""
-      # TikTok/Douyin cookies (optional): Netscape-format cookies.txt từ trình duyệt
-      # đã đăng nhập TikTok — tăng độ thành công khi tải TikTok/Douyin từ IP máy chủ.
       - key: TIKTOK_COOKIES
         value: ""
-      # Admin Telegram user ID — chỉ user này mới dùng được /admin
       - key: ADMIN_USER_ID
         value: ""
-
-  # Tùy chọn 2: Nếu bạn muốn chạy dưới dạng Background Worker (yêu cầu gói Starter trả phí của Render):
-  # - type: worker
-  #   name: telegram-media-downloader-worker
-  #   runtime: docker
-  #   dockerfilePath: ./Dockerfile
-  #   plan: starter
-  #   region: singapore
-  #   envVars:
-  #     - key: BOT_TOKEN
-  #       sync: false
-  #     - key: LOG_LEVEL
-  #       value: INFO
-  #     - key: PYTHONUNBUFFERED
-  #       value: "1"

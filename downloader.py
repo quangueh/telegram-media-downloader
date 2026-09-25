@@ -1,33 +1,35 @@
-"""
-Module tải video đa nền tảng — kiến trúc Router.
-
-    URL ──► Router ──┬── yt-dlp (PO-token clients + bgutil + cookies)
-                     ├── Piped API (YouTube proxy, fallback)
-                     ├── tikwm API (TikTok no-watermark, fallback)
-                     └── FFmpeg (gộp video+audio)
-
-YÊU CẦU khi deploy lên Render/cloud:
-  1. npm + Node >= 20  → cài trong Dockerfile
-  2. pip install bgutil-ytdlp-pot-provider + chạy server node build/main.js
-     Plugin tự nhận server PO-token ở 127.0.0.1:4416, bypass "Sign in to confirm you're not a bot"
-  3. Tùy chọn: YOUTUBE_COOKIES env var (Netscape cookie string) để dùng cookies thật.
-"""
+"""Router tải media đa nền tảng với SSRF protection, yt-dlp, API fallback và FFmpeg."""
 
 import os
 import re
+import json
 import time
 import uuid
 import asyncio
 import tempfile
 import subprocess
-from dataclasses import dataclass, field
+import threading
+import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple, Optional, Union
+from urllib.parse import urljoin
 
 import httpx
 import yt_dlp
 
-from config import MAX_FILE_SIZE, DOWNLOAD_DIR, logger
+from config import (
+    MAX_FILE_SIZE,
+    MAX_PHOTO_FILE_SIZE,
+    MAX_AUDIO_FILE_SIZE,
+    MAX_PHOTO_COUNT,
+    MAX_ALBUM_DURATION,
+    MAX_VIDEO_DURATION,
+    DOWNLOAD_DIR,
+    ALLOW_PRIVATE_URLS,
+    logger,
+)
+from security import InvalidURL, redact_url, validate_public_url
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -100,68 +102,126 @@ class VideoDownloadError(DownloaderError):
     pass
 
 
+class MediaFileTooLargeError(VideoTooLargeError):
+    def __init__(self, size_bytes: int, max_bytes: int, media_type: str = "Tệp media"):
+        super().__init__(size_bytes, max_bytes)
+        self.media_type = media_type
+        self.message = (
+            f"{media_type} ({self.size_mb:.1f}MB) vượt quá giới hạn "
+            f"cho phép ({self.max_mb:.0f}MB)."
+        )
+
+    def __str__(self) -> str:
+        return self.message
+
+
 @dataclass
 class MediaResult:
-    """Kết quả tải media từ một link — hỗ trợ video, album ảnh (TikTok photo) và nhạc nền."""
-    kind: str                       # "video" | "photos"
-    paths: list                     # video: [path]; photos: [path1, path2, ...]
+    kind: str
+    paths: list
     title: str = "Media"
     duration: int = 0
-    audio: Optional[str] = None     # nhạc nền (photo post có kèm music), có thể None
+    audio: Optional[str] = None
+    cleanup_dir: Optional[str] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _url_candidate(url: str) -> str:
+    match = re.search(r"https?://[^\s]+", url, re.IGNORECASE)
+    return match.group(0).rstrip(".,!?;:]}\"") if match else ""
+
+
+def _url_host(url: str) -> str:
+    from security import get_url_host
+
+    try:
+        return get_url_host(_url_candidate(url) or url)
+    except InvalidURL:
+        return ""
+
+
 def _is_tiktok_url(url: str) -> bool:
-    """Kiểm tra liên kết có phải TikTok hay không (hỗ trợ cả liên kết rút gọn)."""
-    return bool(TIKTOK_URL_PATTERN.search(url))
+    from security import host_matches
+
+    return host_matches(_url_host(url), ("tiktok.com",))
 
 
 def _is_douyin_url(url: str) -> bool:
-    """Kiểm tra liên kết có phải Douyin (TikTok Trung Quốc) hay không."""
-    return bool(DOUYIN_URL_PATTERN.search(url))
+    from security import host_matches
+
+    return host_matches(_url_host(url), ("douyin.com", "iesdouyin.com"))
 
 
-def _load_cookies(opts: dict, env_name: str, label: str) -> None:
-    """Đọc cookies (Netscape string hoặc path file) từ env var vào ydl_opts.
-
-    Giúp tải TikTok/YouTube từ IP datacenter bị chặn:
-    - YOUTUBE_COOKIES  → dùng cho link YouTube
-    - TIKTOK_COOKIES   → dùng cho link TikTok / Douyin
-    """
+def _load_cookies(
+    opts: dict,
+    env_name: str,
+    label: str,
+    temporary_files: Optional[list[Path]] = None,
+) -> None:
     cookies_str = os.getenv(env_name, "").strip()
     if not cookies_str:
         return
     if os.path.isfile(cookies_str):
-        opts["cookiefile"] = cookies_str
+        cookie_path = Path(cookies_str)
     else:
-        cookie_file = Path(tempfile.gettempdir()) / f"{env_name.lower()}_cookies.txt"
-        cookie_file.write_text(cookies_str, encoding="utf-8")
-        opts["cookiefile"] = str(cookie_file)
-    logger.info(f"{label} cookies loaded từ {env_name} env var.")
+        if len(cookies_str) > 2 * 1024 * 1024:
+            raise ValueError(f"{env_name} vượt quá giới hạn kích thước")
+        fd, cookie_name = tempfile.mkstemp(
+            prefix=f"{env_name.lower()}_", suffix=".txt",
+        )
+        os.close(fd)
+        cookie_path = Path(cookie_name)
+        cookie_path.write_text(cookies_str, encoding="utf-8")
+        if temporary_files is not None:
+            temporary_files.append(cookie_path)
+    try:
+        cookie_path.chmod(0o600)
+    except OSError:
+        pass
+    opts["cookiefile"] = str(cookie_path)
+    logger.info(f"{label} cookies loaded từ {env_name}.")
 
 
 def _is_youtube_url(url: str) -> bool:
-    """Kiểm tra liên kết có phải YouTube hay không (youtu.be / youtube.com/watch)."""
-    return bool(YOUTUBE_URL_PATTERN.search(url))
+    from security import host_matches
+
+    return host_matches(_url_host(url), ("youtube.com", "youtu.be"))
 
 
 def _extract_youtube_id(url: str) -> Optional[str]:
-    """Trích xuất 11-ký tự video ID từ URL YouTube."""
-    m = YOUTUBE_ID_PATTERN.search(url)
-    return m.group(1) if m else None
+    from urllib.parse import parse_qs, urlsplit
+
+    candidate = _url_candidate(url) or url
+    try:
+        parsed = urlsplit(candidate)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if host in ("youtu.be", "www.youtu.be"):
+            path_id = parsed.path.strip("/").split("/", 1)[0]
+            if re.fullmatch(r"[A-Za-z0-9_-]{11}", path_id):
+                return path_id
+        if host == "youtube.com" or host.endswith(".youtube.com"):
+            if parsed.path == "/watch":
+                values = parse_qs(parsed.query).get("v", [])
+                if values and re.fullmatch(r"[A-Za-z0-9_-]{11}", values[0]):
+                    return values[0]
+            match = re.match(r"^/(?:shorts|embed|v)/([A-Za-z0-9_-]{11})(?:/|$)", parsed.path)
+            if match:
+                return match.group(1)
+    except ValueError:
+        return None
+    return None
 
 
 def _safe_filename(title: str, unique_id: str, max_len: int = 50) -> str:
     """Tạo tên file an toàn từ tiêu đề video."""
-    safe = re.sub(r'[\\/:*?"<>|\n\r\t]+', " ", title)[:max_len].strip()
+    safe = re.sub(r'[\\/:*?"<>|\x00-\x1f\x7f]+', " ", title)[:max_len].strip()
     return safe or "video"
 
 
 def _cleanup_leftovers(directory: Path, unique_id: str) -> None:
-    """Xóa tất cả các file tạm có chứa unique_id khi xảy ra lỗi."""
     try:
         for f in directory.glob(f"*{unique_id}*"):
             if f.is_file():
@@ -170,6 +230,57 @@ def _cleanup_leftovers(directory: Path, unique_id: str) -> None:
                 except OSError:
                     pass
     except Exception:
+        pass
+
+
+def _remove_path(path: Optional[Union[str, Path]]) -> None:
+    if not path:
+        return
+    target = Path(path)
+    try:
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        else:
+            target.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def validate_media_url(url: str) -> str:
+    return validate_public_url(
+        url,
+        resolve_dns=not ALLOW_PRIVATE_URLS,
+        allow_private=ALLOW_PRIVATE_URLS,
+    )
+
+
+def _ensure_file_size(
+    path: Union[str, Path],
+    max_bytes: int = MAX_FILE_SIZE,
+    media_type: str = "Tệp media",
+) -> int:
+    target = Path(path)
+    if not target.is_file():
+        raise VideoDownloadError("Tệp media sau khi xử lý không tồn tại.")
+    size = target.stat().st_size
+    if size > max_bytes:
+        _remove_path(target)
+        raise MediaFileTooLargeError(size, max_bytes, media_type)
+    return size
+
+
+def _new_job_dir(parent: Path) -> Path:
+    parent.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="job_", dir=str(parent)))
+
+
+def cleanup_stale_jobs(parent: Path = DOWNLOAD_DIR, max_age: int = 86400) -> None:
+    try:
+        now = time.time()
+        for directory in parent.glob("job_*"):
+            if directory.is_dir() and now - directory.stat().st_mtime > max_age:
+                _remove_path(directory)
+    except OSError:
         pass
 
 
@@ -228,16 +339,20 @@ def _probe_duration(file_path: str) -> float:
         return 0.0
 
 
+def _kill_process(proc: Optional[subprocess.Popen]) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.kill()
+        proc.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def _ensure_playable(file_path: str, progress_cb: ProgressCB = None) -> str:
-    """
-    Đảm bảo file là H.264 + AAC trong MP4 (moov atom ở đầu) — phát được trên mọi
-    điện thoại / PC / Telegram. Nếu codec không tương thích (VP9/AV1/HEVC...) thì
-    re-encode bằng FFmpeg sang H.264 (có báo tiến trình). Trả về đường dẫn file cuối.
-    """
     vcodec = _probe_stream_codec(file_path, "v:0")
     acodec = _probe_stream_codec(file_path, "a:0")
     container = _probe_container(file_path)
-
     if (
         vcodec in ("h264", "avc1")
         and (not acodec or acodec in ("aac", "mp3"))
@@ -245,10 +360,6 @@ def _ensure_playable(file_path: str, progress_cb: ProgressCB = None) -> str:
     ):
         return file_path
 
-    logger.info(
-        f"File không tương thích (vcodec={vcodec or '-'}, acodec={acodec or '-'}, "
-        f"container={container or '-'}) — đang chuyển sang H.264 + AAC..."
-    )
     duration = _probe_duration(file_path)
     tmp_path = file_path + ".playable.mp4"
     cmd = ["ffmpeg", "-y", "-i", file_path]
@@ -258,8 +369,10 @@ def _ensure_playable(file_path: str, progress_cb: ProgressCB = None) -> str:
         cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
     if acodec and acodec not in ("aac", "mp3"):
         cmd += ["-c:a", "aac", "-b:a", "128k"]
-    cmd += ["-movflags", "+faststart", "-f", "mp4",
-            "-progress", "pipe:1", "-nostats", "-loglevel", "error", tmp_path]
+    cmd += [
+        "-movflags", "+faststart", "-f", "mp4", "-progress", "pipe:1",
+        "-nostats", "-loglevel", "error", tmp_path,
+    ]
 
     def report(pct, text):
         if progress_cb:
@@ -268,15 +381,29 @@ def _ensure_playable(file_path: str, progress_cb: ProgressCB = None) -> str:
             except Exception:
                 pass
 
-    report(None, "🔧 Đang chuyển codec sang H.264 + AAC (phát được mọi thiết bị)...")
-    last_report = 0.0
+    report(None, "🔧 Đang chuyển codec sang H.264 + AAC...")
     proc = None
+    timer = None
+    output_tail: list[str] = []
+    last_report = 0.0
     try:
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace",
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
-        for line in proc.stdout:
+        timer = threading.Timer(900, _kill_process, args=(proc,))
+        timer.daemon = True
+        timer.start()
+        for raw_line in proc.stdout:
+            line = raw_line.strip()
+            if line:
+                output_tail.append(line)
+                if len(output_tail) > 30:
+                    output_tail.pop(0)
             if line.startswith("out_time_us="):
                 try:
                     out_us = int(line.split("=", 1)[1])
@@ -288,30 +415,26 @@ def _ensure_playable(file_path: str, progress_cb: ProgressCB = None) -> str:
                             report(pct, f"🔧 Đang chuyển codec... {pct:.0f}%")
                 except ValueError:
                     pass
-        proc.wait(timeout=900)
+        proc.wait()
         if proc.returncode == 0 and os.path.exists(tmp_path):
             os.replace(tmp_path, file_path)
+            _ensure_file_size(file_path, MAX_FILE_SIZE, "Video")
             report(100, "✅ Chuyển codec xong (H.264 + AAC)")
             return file_path
-        stderr = proc.stderr.read()[-300:] if proc.stderr else "unknown"
-        logger.warning(f"Re-encode thất bại: {stderr}")
-    except Exception as e:
-        logger.warning(f"Re-encode lỗi: {e}")
+        logger.warning("Re-encode thất bại: %s", " ".join(output_tail)[-300:])
+    except Exception as exc:
+        logger.warning("Re-encode lỗi: %s", exc)
     finally:
+        if timer:
+            timer.cancel()
         if proc:
+            if proc.poll() is None:
+                _kill_process(proc)
             try:
                 proc.stdout.close()
             except Exception:
                 pass
-            try:
-                proc.stderr.close()
-            except Exception:
-                pass
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        _remove_path(tmp_path)
     return file_path
 
 
@@ -335,6 +458,24 @@ class IncompleteDownloadError(DownloaderError):
     """File tải về bị cắt ngắn (ít hơn content-length) — file hỏng, cần tải lại."""
 
 
+async def _read_limited_json(
+    response: httpx.Response,
+    max_bytes: int = 2 * 1024 * 1024,
+) -> dict:
+    length = int(response.headers.get("content-length") or 0)
+    if length > max_bytes:
+        raise IncompleteDownloadError("Dữ liệu API vượt quá giới hạn.")
+    body = bytearray()
+    async for chunk in response.aiter_bytes(chunk_size=1 << 16):
+        body.extend(chunk)
+        if len(body) > max_bytes:
+            raise IncompleteDownloadError("Dữ liệu API vượt quá giới hạn.")
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IncompleteDownloadError("API trả về JSON không hợp lệ.") from exc
+
+
 async def _http_download_stream(
     url: str,
     dest: Path,
@@ -343,47 +484,62 @@ async def _http_download_stream(
     label: str = "⬇️ Đang tải",
     headers: Optional[dict] = None,
     progress_interval: float = 1.0,
+    max_bytes: int = MAX_FILE_SIZE,
+    media_type: str = "Tệp media",
 ) -> int:
-    """Tải file mp4 từ URL bằng httpx streaming.
-
-    - Dùng headers trình duyệt mặc định (TikTok CDN throttle UA lạ).
-    - Báo tiến trình mỗi progress_interval giây.
-    - Ném VideoTooLargeError nếu vượt giới hạn; IncompleteDownloadError nếu tải bị
-      cắt ngắn so với content-length (file hỏng). Trả về kích thước bytes.
-    """
     downloaded = 0
     last_report = 0.0
     total = 0
+    current_url = url
+    dest.parent.mkdir(parents=True, exist_ok=True)
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(timeout, connect=15),
-        follow_redirects=True,
+        follow_redirects=False,
         headers=headers or _BROWSER_HEADERS,
     ) as client:
-        async with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("content-length") or 0)
-            with open(dest, "wb") as f:
-                async for chunk in resp.aiter_bytes(chunk_size=1 << 16):
-                    downloaded += len(chunk)
-                    if downloaded > MAX_FILE_SIZE:
-                        raise VideoTooLargeError(downloaded, MAX_FILE_SIZE)
-                    f.write(chunk)
-                    if progress_cb:
-                        now = time.monotonic()
-                        if now - last_report >= progress_interval:
-                            last_report = now
-                            if total > 0:
-                                pct = downloaded / total * 100
-                                text = f"{label}: {_fmt_mb(downloaded)}/{_fmt_mb(total)}"
-                            else:
-                                pct = None
-                                text = f"{label}: {_fmt_mb(downloaded)}"
-                            try:
-                                progress_cb(pct, text)
-                            except Exception:
-                                pass
+        for redirect_count in range(6):
+            if ALLOW_PRIVATE_URLS:
+                await asyncio.to_thread(validate_public_url, current_url, resolve_dns=False, allow_private=True)
+            else:
+                await asyncio.to_thread(validate_public_url, current_url)
+            async with client.stream("GET", current_url) as resp:
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("location")
+                    if not location or redirect_count >= 5:
+                        raise IncompleteDownloadError("Chuyển hướng URL không hợp lệ.")
+                    current_url = urljoin(str(resp.url), location)
+                    continue
+                resp.raise_for_status()
+                try:
+                    total = int(resp.headers.get("content-length") or 0)
+                except ValueError:
+                    total = 0
+                if total > max_bytes:
+                    raise MediaFileTooLargeError(total, max_bytes, media_type)
+                with open(dest, "wb") as file:
+                    async for chunk in resp.aiter_bytes(chunk_size=1 << 16):
+                        downloaded += len(chunk)
+                        if downloaded > max_bytes:
+                            raise MediaFileTooLargeError(downloaded, max_bytes, media_type)
+                        file.write(chunk)
+                        if progress_cb:
+                            now = time.monotonic()
+                            if now - last_report >= progress_interval:
+                                last_report = now
+                                if total > 0:
+                                    pct = downloaded / total * 100
+                                    text = f"{label}: {_fmt_mb(downloaded)}/{_fmt_mb(total)}"
+                                else:
+                                    pct = None
+                                    text = f"{label}: {_fmt_mb(downloaded)}"
+                                try:
+                                    progress_cb(pct, text)
+                                except Exception:
+                                    pass
+                break
+        else:
+            raise IncompleteDownloadError("Chuyển hướng URL quá nhiều lần.")
 
-    # Kiểm tra file đã tải đủ chưa — cắt ngắn = file hỏng, không gửi cho user
     if total > 0 and downloaded < total:
         raise IncompleteDownloadError(
             f"Tải xuống bị cắt ngắn: {downloaded}/{total} bytes"
@@ -435,6 +591,7 @@ def _build_ytdlp_opts(
     unique_id: str,
     progress_cb: ProgressCB = None,
     attempt: int = 0,
+    cookie_files: Optional[list[Path]] = None,
 ) -> dict:
     """Xây dựng ydl_opts cho yt-dlp, tối ưu theo nền tảng.
 
@@ -463,6 +620,7 @@ def _build_ytdlp_opts(
         "retries": 1,
         "fragment_retries": 1,
         "extractor_retries": 1,
+        "concurrent_fragment_downloads": 1,
         "socket_timeout": 10,
         "http_headers": {
             "User-Agent": (
@@ -500,9 +658,9 @@ def _build_ytdlp_opts(
 
     # Cookies theo platform (giúp tải từ IP datacenter bị chặn)
     if _is_youtube_url(url):
-        _load_cookies(opts, "YOUTUBE_COOKIES", "YouTube")
+        _load_cookies(opts, "YOUTUBE_COOKIES", "YouTube", cookie_files)
     if _is_tiktok_url(url) or _is_douyin_url(url):
-        _load_cookies(opts, "TIKTOK_COOKIES", "TikTok/Douyin")
+        _load_cookies(opts, "TIKTOK_COOKIES", "TikTok/Douyin", cookie_files)
 
     # Progress hook: report % tải về qua callback (nếu có)
     if progress_cb:
@@ -543,12 +701,16 @@ def _sync_ytdlp_download(
     target_dir.mkdir(parents=True, exist_ok=True)
     unique_id = uuid.uuid4().hex[:10]
 
-    logger.info(f"yt-dlp đang xử lý: {url}")
+    logger.info("yt-dlp đang xử lý: %s", redact_url(url))
 
     # Retry tối đa 2 lần cho YouTube: lần 1 dùng player clients đã biết,
     # lần 2 dùng client mặc định của yt-dlp (nếu lần 1 bị chặn).
     for attempt in range(2):
-        opts = _build_ytdlp_opts(url, target_dir, unique_id, progress_cb, attempt=attempt)
+        cookie_files: list[Path] = []
+        opts = _build_ytdlp_opts(
+            url, target_dir, unique_id, progress_cb, attempt=attempt,
+            cookie_files=cookie_files,
+        )
         downloaded_filepath: Optional[str] = None
 
         def postprocessor_hook(info: dict) -> None:
@@ -567,11 +729,20 @@ def _sync_ytdlp_download(
 
                 # Kiểm tra kích thước ước lượng nếu có sẵn
                 estimated_size = info_dict.get("filesize") or info_dict.get("filesize_approx")
-                if estimated_size and estimated_size > MAX_FILE_SIZE:
+                try:
+                    estimated_size = int(estimated_size or 0)
+                except (TypeError, ValueError):
+                    estimated_size = 0
+                if estimated_size > MAX_FILE_SIZE:
                     raise VideoTooLargeError(estimated_size, MAX_FILE_SIZE)
 
-                title = info_dict.get("title", "Video")
-                duration = int(info_dict.get("duration") or 0)
+                title = str(info_dict.get("title", "Video") or "Video")
+                try:
+                    duration = int(info_dict.get("duration") or 0)
+                except (TypeError, ValueError):
+                    duration = 0
+                if duration > MAX_VIDEO_DURATION:
+                    raise VideoDownloadError("Video vượt quá thời lượng được phép.")
 
                 download_info = ydl.extract_info(url, download=True)
 
@@ -592,25 +763,14 @@ def _sync_ytdlp_download(
                         else:
                             raise VideoDownloadError("Không tìm thấy tệp video sau khi tải xuống.")
 
-                actual_size = os.path.getsize(final_file)
-                if actual_size > MAX_FILE_SIZE:
-                    try:
-                        os.remove(final_file)
-                    except OSError:
-                        pass
-                    raise VideoTooLargeError(actual_size, MAX_FILE_SIZE)
-
-                # Đảm bảo codec H.264 + AAC trong mp4 — tránh màn trắng / unsupported
+                _ensure_file_size(final_file, MAX_FILE_SIZE, "Video")
                 final_file = _ensure_playable(final_file, progress_cb=progress_cb)
-                actual_size = os.path.getsize(final_file)
-                if actual_size > MAX_FILE_SIZE:
-                    try:
-                        os.remove(final_file)
-                    except OSError:
-                        pass
-                    raise VideoTooLargeError(actual_size, MAX_FILE_SIZE)
+                actual_size = _ensure_file_size(final_file, MAX_FILE_SIZE, "Video")
 
-                logger.info(f"yt-dlp tải thành công: {final_file} ({actual_size / (1024*1024):.1f}MB)")
+                logger.info(
+                    "yt-dlp tải thành công: %s (%.1fMB)",
+                    Path(final_file).name, actual_size / (1024 * 1024),
+                )
                 return final_file, title, duration
         except yt_dlp.utils.DownloadError as e:
             msg = _clean_error(e)
@@ -630,11 +790,73 @@ def _sync_ytdlp_download(
                 )
                 continue
             raise VideoDownloadError(msg) from e
+        finally:
+            for cookie_path in cookie_files:
+                _remove_path(cookie_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  BACKEND 2: Piped API (YouTube proxy, fallback khi yt-dlp bị chặn)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _piped_height(stream: dict) -> int:
+    match = re.search(r"(\d+)p", str(stream.get("quality", "")))
+    return int(match.group(1)) if match else 0
+
+
+def _piped_estimated_size(stream: dict, duration: int) -> Optional[int]:
+    size = stream.get("size") or stream.get("filesize")
+    try:
+        if size:
+            return int(size)
+    except (TypeError, ValueError):
+        pass
+    bitrate = stream.get("bitrate") or stream.get("averageBitrate")
+    try:
+        if bitrate and duration:
+            return int(float(bitrate) * max(1, duration) / 8)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _select_piped_streams(
+    streams: list,
+    audio_streams: list,
+    duration: int,
+) -> tuple[Optional[dict], bool]:
+    combined = [
+        stream for stream in streams
+        if not stream.get("videoOnly") and stream.get("format") == "MPEG_4"
+    ]
+    video_only = [
+        stream for stream in streams
+        if stream.get("videoOnly") and stream.get("format") == "MPEG_4"
+    ]
+    combined.sort(
+        key=lambda stream: (
+            _piped_height(stream),
+            stream.get("bitrate") or stream.get("averageBitrate") or 0,
+        ),
+        reverse=True,
+    )
+    for stream in combined:
+        estimate = _piped_estimated_size(stream, duration)
+        if estimate is None or estimate <= MAX_FILE_SIZE:
+            return stream, False
+    video_only.sort(
+        key=lambda stream: (
+            _piped_height(stream),
+            stream.get("bitrate") or stream.get("averageBitrate") or 0,
+        ),
+        reverse=True,
+    )
+    for stream in video_only:
+        estimate = _piped_estimated_size(stream, duration)
+        if estimate is None or estimate <= MAX_FILE_SIZE:
+            return stream, bool(audio_streams)
+    return None, False
+
 
 async def _download_via_piped(
     url: str,
@@ -653,10 +875,32 @@ async def _download_via_piped(
     for instance in PIPED_INSTANCES:
         api_url = f"https://{instance}/streams/{video_id}"
         try:
-            async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
-                resp = await client.get(api_url)
-                resp.raise_for_status()
-                data = resp.json()
+            if ALLOW_PRIVATE_URLS:
+                await asyncio.to_thread(validate_public_url, api_url, resolve_dns=False, allow_private=True)
+            else:
+                await asyncio.to_thread(validate_public_url, api_url)
+            async with httpx.AsyncClient(timeout=25, follow_redirects=False) as client:
+                current_api_url = api_url
+                for redirect_count in range(4):
+                    async with client.stream("GET", current_api_url) as response:
+                        if response.status_code in (301, 302, 303, 307, 308):
+                            location = response.headers.get("location")
+                            if not location or redirect_count >= 3:
+                                raise IncompleteDownloadError("Piped chuyển hướng không hợp lệ.")
+                            current_api_url = urljoin(str(response.url), location)
+                            if ALLOW_PRIVATE_URLS:
+                                await asyncio.to_thread(
+                                    validate_public_url, current_api_url,
+                                    resolve_dns=False, allow_private=True,
+                                )
+                            else:
+                                await asyncio.to_thread(validate_public_url, current_api_url)
+                            continue
+                        response.raise_for_status()
+                        data = await _read_limited_json(response)
+                        break
+                else:
+                    raise IncompleteDownloadError("Piped chuyển hướng quá nhiều lần.")
         except Exception as e:
             logger.warning(f"Piped [{instance}] fail: {e}")
             continue
@@ -665,43 +909,38 @@ async def _download_via_piped(
             logger.warning(f"Piped [{instance}] error: {data.get('error')}")
             continue
 
-        title = data.get("title", "YouTube video") or "YouTube video"
-        duration = int(data.get("duration") or 0)
+        title = str(data.get("title", "YouTube video") or "YouTube video")
+        try:
+            duration = int(data.get("duration") or 0)
+        except (TypeError, ValueError):
+            continue
+        if duration > MAX_VIDEO_DURATION:
+            raise VideoDownloadError("Video vượt quá thời lượng được phép.")
 
-        # Tìm video stream tốt nhất (ưu tiên progressive mp4, nếu không thì biggest videoOnly)
-        streams = data.get("videoStreams", [])
-        audio_streams = data.get("audioStreams", [])
-
-        # Progressive (video+audio merged) — thường ≤720p, không cần ffmpeg
-        combined = [s for s in streams if not s.get("videoOnly") and s.get("format") == "MPEG_4"]
-        # Video only (mp4)
-        video_only = [s for s in streams if s.get("videoOnly") and s.get("format") == "MPEG_4"]
-
-        # Lấy số bitrate/dimension từ quality string để sắp xếp
-        def _parse_height(s):
-            q = s.get("quality", "0p")
-            m = re.search(r"(\d+)p", q)
-            return int(m.group(1)) if m else 0
-
-        # Ưu tiên progressive mp4 nhỏ nhất vừa với 49MB (thường 360p/720p progressive)
-        if combined:
-            combined.sort(key=_parse_height)
-            chosen_stream = combined[0]
-            need_merge = False
-        elif video_only:
-            # Nếu cần merge: tải video + audio, rồi ffmpeg
-            video_only.sort(key=_parse_height)
-            chosen_stream = video_only[0]
-            need_merge = bool(audio_streams)
-        else:
-            logger.warning(f"Piped [{instance}] không tìm thấy mp4 stream")
+        streams = data.get("videoStreams", []) or []
+        audio_streams = data.get("audioStreams", []) or []
+        if not isinstance(streams, list) or not isinstance(audio_streams, list):
+            continue
+        chosen_stream, need_merge = _select_piped_streams(streams, audio_streams, duration)
+        if chosen_stream is None:
+            logger.warning(f"Piped [{instance}] không tìm thấy mp4 stream phù hợp")
             continue
 
         stream_url = chosen_stream.get("url")
         if not stream_url:
             continue
+        try:
+            if ALLOW_PRIVATE_URLS:
+                await asyncio.to_thread(validate_public_url, stream_url, resolve_dns=False, allow_private=True)
+            else:
+                await asyncio.to_thread(validate_public_url, stream_url)
+        except InvalidURL:
+            continue
 
-        logger.info(f"Piped [{instance}] tìm thấy stream: {chosen_stream.get('quality')} merge={need_merge}")
+        logger.info(
+            "Piped [%s] chọn stream %s merge=%s",
+            instance, chosen_stream.get("quality"), need_merge,
+        )
 
         # Tải video stream
         safe_title = _safe_filename(title, unique_id)
@@ -710,11 +949,13 @@ async def _download_via_piped(
         try:
             await _http_download_stream(
                 stream_url, video_path, progress_cb=progress_cb,
-                label="⬇️ Tải video (Piped)",
+                label="⬇️ Tải video (Piped)", max_bytes=MAX_FILE_SIZE,
+                media_type="Video",
             )
         except VideoTooLargeError:
             raise
         except Exception as e:
+            _remove_path(video_path)
             logger.warning(f"Piped [{instance}] tải video fail: {e}")
             continue
 
@@ -727,12 +968,17 @@ async def _download_via_piped(
                 logger.warning("Piped: không tìm thấy audio stream, dùng video-only")
                 final_path = str(video_path)
             else:
+                audio_m4a.sort(
+                    key=lambda stream: stream.get("bitrate") or stream.get("averageBitrate") or 0,
+                    reverse=True,
+                )
                 audio_url = audio_m4a[0].get("url")
                 audio_path = target_dir / f"{safe_title}_{unique_id}_audio.m4a"
                 try:
                     await _http_download_stream(
                         audio_url, audio_path, progress_cb=progress_cb,
-                        label="⬇️ Tải audio (Piped)",
+                        label="⬇️ Tải audio (Piped)", max_bytes=MAX_AUDIO_FILE_SIZE,
+                        media_type="Audio",
                     )
                 except Exception as e:
                     logger.warning(f"Piped [{instance}] tải audio fail: {e}")
@@ -771,15 +1017,13 @@ async def _download_via_piped(
 
         # Kiểm tra kích thước cuối
         if os.path.exists(final_path):
+            _ensure_file_size(final_path, MAX_FILE_SIZE, "Video")
             final_path = await asyncio.to_thread(_ensure_playable, final_path, progress_cb)
-            actual_size = os.path.getsize(final_path)
-            if actual_size > MAX_FILE_SIZE:
-                try:
-                    os.remove(final_path)
-                except OSError:
-                    pass
-                raise VideoTooLargeError(actual_size, MAX_FILE_SIZE)
-            logger.info(f"Piped tải thành công: {final_path} ({actual_size / (1024*1024):.1f}MB)")
+            actual_size = _ensure_file_size(final_path, MAX_FILE_SIZE, "Video")
+            logger.info(
+                "Piped tải thành công: %s (%.1fMB)",
+                Path(final_path).name, actual_size / (1024 * 1024),
+            )
             return final_path, title, duration
 
     return None
@@ -795,6 +1039,8 @@ async def _download_stream_with_retry(
     label: str,
     progress_cb: ProgressCB = None,
     attempts: int = 3,
+    max_bytes: int = MAX_FILE_SIZE,
+    media_type: str = "Tệp media",
 ) -> int:
     """Tải stream với retry — CDN TikTok hay flaky/cắt ngắn, request mới thường thành công."""
     last_err: Optional[BaseException] = None
@@ -809,6 +1055,7 @@ async def _download_stream_with_retry(
         try:
             return await _http_download_stream(
                 url, dest, timeout=40, progress_cb=progress_cb, label=label,
+                max_bytes=max_bytes, media_type=media_type,
             )
         except VideoTooLargeError:
             raise
@@ -826,33 +1073,54 @@ async def _download_stream_with_retry(
 
 
 async def _fetch_tikwm_info(url: str) -> Optional[dict]:
-    """Resolve link rút gọn + gọi tikwm API, trả về dict data, hoặc None nếu lỗi."""
-    match = TIKTOK_URL_PATTERN.search(url)
-    if not match:
+    if not _is_tiktok_url(url):
         return None
-
-    tiktok_url = match.group(0)
+    tiktok_url = _url_candidate(url) or url
     if "vm.tiktok.com" in tiktok_url or "vt.tiktok.com" in tiktok_url:
         try:
             async with httpx.AsyncClient(
-                follow_redirects=True, timeout=15, headers=_BROWSER_HEADERS,
+                follow_redirects=False, timeout=15, headers=_BROWSER_HEADERS,
             ) as client:
-                resp = await client.get(tiktok_url)
-                tiktok_url = str(resp.url)
-        except Exception as e:
-            logger.warning(f"Không thể mở rộng liên kết rút gọn TikTok: {e}")
+                current_url = tiktok_url
+                for redirect_count in range(4):
+                    if ALLOW_PRIVATE_URLS:
+                        await asyncio.to_thread(validate_public_url, current_url, resolve_dns=False, allow_private=True)
+                    else:
+                        await asyncio.to_thread(validate_public_url, current_url)
+                    async with client.stream("GET", current_url) as response:
+                        if response.status_code not in (301, 302, 303, 307, 308):
+                            response.raise_for_status()
+                            tiktok_url = str(response.url)
+                            break
+                        location = response.headers.get("location")
+                    if not location or redirect_count >= 3:
+                        raise IncompleteDownloadError("TikTok chuyển hướng không hợp lệ.")
+                    current_url = urljoin(str(response.url), location)
+                else:
+                    raise IncompleteDownloadError("TikTok chuyển hướng quá nhiều lần.")
+        except Exception as exc:
+            logger.warning("Không thể mở rộng liên kết TikTok: %s", _clean_error(exc))
 
     try:
+        if ALLOW_PRIVATE_URLS:
+            await asyncio.to_thread(
+                validate_public_url, TIKTOK_FALLBACK_API, resolve_dns=False,
+                allow_private=True,
+            )
+        else:
+            await asyncio.to_thread(validate_public_url, TIKTOK_FALLBACK_API)
         async with httpx.AsyncClient(timeout=60, headers=_BROWSER_HEADERS) as client:
-            resp = await client.post(TIKTOK_FALLBACK_API, data={"url": tiktok_url, "hd": "1"})
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception as e:
-        logger.warning(f"TikTok tikwm API không phản hồi: {e}")
+            async with client.stream(
+                "POST", TIKTOK_FALLBACK_API, data={"url": tiktok_url, "hd": "1"},
+            ) as resp:
+                resp.raise_for_status()
+                data = await _read_limited_json(resp)
+    except Exception as exc:
+        logger.warning("TikTok tikwm API không phản hồi: %s", _clean_error(exc))
         return None
 
     if data.get("code") != 0 or not data.get("data"):
-        logger.warning(f"TikTok tikwm API lỗi: {data.get('msg')}")
+        logger.warning("TikTok tikwm API lỗi: %s", data.get("msg"))
         return None
     return data["data"]
 
@@ -869,6 +1137,9 @@ def _make_photo_video(
     nên muốn video phát được phải render slideshow bằng ffmpeg.
     """
     try:
+        if not image_paths or len(image_paths) > MAX_PHOTO_COUNT:
+            raise ValueError("Số lượng ảnh vượt quá giới hạn.")
+        duration = max(1.0, min(float(duration), float(MAX_ALBUM_DURATION)))
         if len(image_paths) == 1:
             cmd = [
                 "ffmpeg", "-y",
@@ -929,7 +1200,7 @@ async def _download_via_tikwm(
     if not info:
         return None
 
-    title = (info.get("title") or "Video TikTok").strip() or "Video TikTok"
+    title = str(info.get("title") or "Video TikTok").strip() or "Video TikTok"
 
     target_dir = output_dir
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -940,6 +1211,14 @@ async def _download_via_tikwm(
     #  B) Ảnh + nhạc (phổ biến): tikwm chỉ cấp ảnh + MP3 → render slideshow video
     images = info.get("images") or []
     duration = int(info.get("duration") or 0)
+    if not isinstance(images, list):
+        images = []
+    if images and duration > MAX_ALBUM_DURATION:
+        raise VideoDownloadError("Album vượt quá thời lượng được phép.")
+    if not images and duration > MAX_VIDEO_DURATION:
+        raise VideoDownloadError("Video vượt quá thời lượng được phép.")
+    if len(images) > MAX_PHOTO_COUNT:
+        raise VideoDownloadError("Album vượt quá số lượng ảnh được phép.")
     if images:
         audio_path: Optional[str] = None
         media_url = info.get("play") or info.get("hdplay")
@@ -948,6 +1227,7 @@ async def _download_via_tikwm(
             try:
                 await _http_download_stream(
                     media_url, media_file, timeout=40, label="⏳ Kiểm tra media...",
+                    max_bytes=MAX_FILE_SIZE, media_type="Video",
                 )
                 vcodec = await asyncio.to_thread(_probe_stream_codec, str(media_file), "v:0")
                 if vcodec:
@@ -967,6 +1247,7 @@ async def _download_via_tikwm(
                 except OSError:
                     audio_file = str(media_file)
                 audio_path = audio_file
+                _ensure_file_size(audio_path, MAX_AUDIO_FILE_SIZE, "Audio")
             except Exception as e:
                 logger.warning(f"Kiểm tra media photo post fail: {e}")
                 try:
@@ -982,6 +1263,7 @@ async def _download_via_tikwm(
                     audio_file = target_dir / f"{unique_id}_audio.mp3"
                     await _http_download_stream(
                         music_url, audio_file, timeout=40, label="🎵 Tải nhạc nền",
+                        max_bytes=MAX_AUDIO_FILE_SIZE, media_type="Audio",
                     )
                     if not await asyncio.to_thread(_probe_stream_codec, str(audio_file), "v:0"):
                         audio_path = str(audio_file)
@@ -1001,6 +1283,7 @@ async def _download_via_tikwm(
                 await _http_download_stream(
                     img_url, img_path, timeout=40,
                     label=f"🖼️ Tải ảnh {i}/{len(images)}",
+                    max_bytes=MAX_PHOTO_FILE_SIZE, media_type="Ảnh",
                 )
                 paths.append(str(img_path))
         except Exception as e:
@@ -1022,9 +1305,11 @@ async def _download_via_tikwm(
         if audio_path and paths:
             video_out = str(target_dir / f"{unique_id}.mp4")
             audio_dur = await asyncio.to_thread(_probe_duration, audio_path) or 10.0
+            audio_dur = max(1.0, min(audio_dur, float(MAX_ALBUM_DURATION)))
             try:
                 # Chạy ffmpeg trong thread — tránh block event loop (bot không bị đơ)
                 await asyncio.to_thread(_make_photo_video, paths, audio_path, video_out, audio_dur)
+                _ensure_file_size(video_out, MAX_FILE_SIZE, "Video")
                 for p in paths:
                     try:
                         os.remove(p)
@@ -1039,7 +1324,14 @@ async def _download_via_tikwm(
             except Exception as e:
                 logger.warning(f"Render slideshow fail, gửi ảnh + nhạc riêng: {e}")
 
-        logger.info(f"TikTok photo post: {len(paths)} ảnh" + (" + nhạc nền" if audio_path else ""))
+        for path in paths:
+            _ensure_file_size(path, MAX_PHOTO_FILE_SIZE, "Ảnh")
+        if audio_path:
+            _ensure_file_size(audio_path, MAX_AUDIO_FILE_SIZE, "Audio")
+        logger.info(
+            "TikTok photo post: %s ảnh%s", len(paths),
+            " + nhạc nền" if audio_path else "",
+        )
         return MediaResult("photos", paths, title=title, duration=len(paths), audio=audio_path)
 
     # ── TikTok VIDEO ──
@@ -1059,6 +1351,7 @@ async def _download_via_tikwm(
     try:
         await _download_stream_with_retry(
             video_url, file_path, label="⬇️ Tải TikTok (tikwm)", progress_cb=progress_cb,
+            max_bytes=MAX_FILE_SIZE, media_type="Video",
         )
     except VideoTooLargeError:
         _cleanup_leftovers(target_dir, unique_id)
@@ -1068,8 +1361,9 @@ async def _download_via_tikwm(
         logger.warning(f"Tải TikTok tikwm stream fail: {e}")
         return None
 
-    logger.info(f"TikTok tikwm tải thành công: {file_path}")
+    logger.info("TikTok tikwm tải thành công: %s", Path(file_path).name)
     file_path = await asyncio.to_thread(_ensure_playable, str(file_path), progress_cb)
+    _ensure_file_size(file_path, MAX_FILE_SIZE, "Video")
     return MediaResult("video", [str(file_path)], title=title, duration=duration)
 
 
@@ -1114,14 +1408,40 @@ async def _run_executor(
         heartbeat = asyncio.create_task(beat())
 
     try:
-        # shield: khi timeout, không huỷ executor (thread không thể huỷ) — chỉ bỏ chờ
-        return await asyncio.wait_for(asyncio.shield(executor_future), timeout=timeout)
+        return await asyncio.wait_for(executor_future, timeout=timeout)
+    except asyncio.TimeoutError:
+        def consume_result(future):
+            try:
+                future.exception()
+            except BaseException:
+                pass
+        executor_future.add_done_callback(consume_result)
+        raise
     finally:
         if heartbeat:
             heartbeat.cancel()
 
 
 async def extract_and_download(
+    url: str,
+    output_path: Optional[Union[str, Path]] = None,
+    progress_cb: ProgressCB = None,
+) -> MediaResult:
+    validated_url = await asyncio.to_thread(validate_media_url, url)
+    parent_dir = Path(output_path) if output_path else DOWNLOAD_DIR
+    job_dir = _new_job_dir(parent_dir)
+    try:
+        result = await _extract_and_download_impl(
+            validated_url, job_dir, progress_cb,
+        )
+        result.cleanup_dir = str(job_dir)
+        return result
+    except BaseException:
+        _remove_path(job_dir)
+        raise
+
+
+async def _extract_and_download_impl(
     url: str,
     output_path: Optional[Union[str, Path]] = None,
     progress_cb: ProgressCB = None,

@@ -14,6 +14,7 @@ sys.path.insert(0, str(BASE_DIR))
 import yt_dlp
 
 from config import MAX_FILE_SIZE, DOWNLOAD_DIR
+from security import InvalidURL, redact_url, validate_public_url
 from downloader import (
     VideoTooLargeError,
     VideoDownloadError,
@@ -31,6 +32,7 @@ from downloader import (
     _is_douyin_url,
     _is_tiktok_url,
     _load_cookies,
+    _select_piped_streams,
 )
 
 FFMPEG_AVAILABLE = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
@@ -227,7 +229,6 @@ class TestTikTokPhotoPost(unittest.TestCase):
         return dest
 
     async def _run(self, images, music_url="https://example.com/music.mp3", video_codec="", render_ok=False):
-        import asyncio
         import contextlib
         from downloader import _download_via_tikwm
 
@@ -260,10 +261,13 @@ class TestTikTokPhotoPost(unittest.TestCase):
             stack.enter_context(mock.patch("downloader._probe_stream_codec", side_effect=fake_probe))
             if render_ok:
                 stack.enter_context(mock.patch("downloader._make_photo_video", side_effect=fake_render))
-            return await _download_via_tikwm(
+            result = await _download_via_tikwm(
                 "https://www.tiktok.com/@user/photo/123456",
                 DOWNLOAD_DIR,
             )
+            for path in result.paths + ([result.audio] if result.audio else []):
+                self.addCleanup(lambda value=path: Path(value).unlink(missing_ok=True))
+            return result
 
     def test_photo_post_slideshow_video(self):
         """Photo post dạng slideshow (`play` là video thật) → trả VIDEO gốc."""
@@ -323,6 +327,30 @@ class TestTikTokPhotoPost(unittest.TestCase):
         self.assertIsNone(MediaResult("photos", ["a.jpg"]).audio)
 
 
+class TestUrlSecurity(unittest.TestCase):
+    def test_rejects_private_and_non_http_urls(self):
+        for value in (
+            "http://127.0.0.1/x",
+            "http://169.254.169.254/latest/meta-data",
+            "file:///etc/passwd",
+            "https://user:password@example.com/x",
+            "https://example.com:8080/x",
+        ):
+            with self.assertRaises(InvalidURL):
+                validate_public_url(value, resolve_dns=False)
+
+    def test_accepts_public_url_without_dns_in_tests(self):
+        value = "https://example.com/video?id=secret"
+        self.assertEqual(validate_public_url(value, resolve_dns=False), value)
+        self.assertEqual(redact_url(value), "https://example.com/video")
+
+    def test_host_suffix_matching_is_exact(self):
+        from security import host_matches
+
+        self.assertTrue(host_matches("www.youtube.com", ("youtube.com",)))
+        self.assertFalse(host_matches("youtube.com.evil.test", ("youtube.com",)))
+
+
 class TestPlatformDetection(unittest.TestCase):
     """Nhận diện link theo nền tảng (TikTok / Douyin / YouTube)."""
 
@@ -345,13 +373,16 @@ class TestPlatformDetection(unittest.TestCase):
         self.assertFalse(_is_douyin_url("https://www.tiktok.com/@u/video/1"))
 
     def test_load_cookies_sets_cookiefile(self):
-        import tempfile as _tf
         opts = {}
+        temporary_files = []
         with mock.patch.dict(os.environ, {"TIKTOK_COOKIES": "# Netscape\nx.com\tTRUE\t/"},
                              clear=False):
-            _load_cookies(opts, "TIKTOK_COOKIES", "TikTok")
+            _load_cookies(opts, "TIKTOK_COOKIES", "TikTok", temporary_files)
         self.assertIn("cookiefile", opts)
-        self.assertTrue(Path(opts["cookiefile"]).exists())
+        cookie_path = Path(opts["cookiefile"])
+        self.assertTrue(cookie_path.exists())
+        self.assertEqual(temporary_files, [cookie_path])
+        cookie_path.unlink()
 
     def test_load_cookies_empty(self):
         opts = {}
@@ -379,6 +410,23 @@ class TestYouTubeBlockDetection(unittest.TestCase):
             "ERROR: unable to download video data: HTTP Error 403: Forbidden"
         ))
         self.assertFalse(_is_youtube_blocked(""))
+
+
+class TestPipedSelection(unittest.TestCase):
+    def test_prefers_highest_quality_that_fits(self):
+        streams = [
+            {"videoOnly": False, "format": "MPEG_4", "quality": "1080p", "size": MAX_FILE_SIZE + 1},
+            {"videoOnly": False, "format": "MPEG_4", "quality": "720p", "size": 1024},
+            {"videoOnly": False, "format": "MPEG_4", "quality": "360p", "size": 512},
+        ]
+        selected, merge = _select_piped_streams(streams, [], 10)
+        self.assertEqual(selected["quality"], "720p")
+        self.assertFalse(merge)
+
+    def test_returns_none_without_mp4(self):
+        selected, merge = _select_piped_streams([], [], 10)
+        self.assertIsNone(selected)
+        self.assertFalse(merge)
 
 
 class TestYtdlpOptsAttempts(unittest.TestCase):

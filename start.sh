@@ -1,46 +1,18 @@
 #!/bin/sh
-# ═══════════════════════════════════════════════════════════════════════════════
-#  start.sh — Khởi động bgutil PO-token server (background) → Python bot
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-# bgutil server (https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
-# listens on http://127.0.0.1:4416 — yt-dlp plugin auto-detects it.
-# Generates PO tokens via BotGuard to bypass "Sign in to confirm you're not a bot"
-# on YouTube when running on datacenter IPs (Render, AWS, etc.)
-#
-set -e
+set -eu
 
-echo "══════════════════════════════════════════════════════════════════"
-echo " Starting bgutil PO-token server on port ${BGUTIL_PORT:-4416}..."
-echo "══════════════════════════════════════════════════════════════════"
-
-# Khởi chạy Node.js server ở background (giới hạn 64MB heap để vừa 512MB RAM)
-cd /opt/bgutil/server
-node --max-old-space-size=64 build/main.js --port ${BGUTIL_PORT:-4416} &
-BGUTIL_PID=$!
-echo "bgutil PID: $BGUTIL_PID"
-
-# Đợi server sẵn sàng (kiểm tra TCP port mỗi 0.5s, tối đa 30s)
-PORT="${BGUTIL_PORT:-4416}"
-echo "Đợi bgutil server lắng nghe trên port ${PORT}..."
-for i in $(seq 1 60); do
-    if curl -sf "http://127.0.0.1:${PORT}/ping" >/dev/null 2>&1; then
-        echo "✓ bgutil server sẵn sàng! (sau ${i} lần kiểm tra)"
-        break
-    fi
-    sleep 0.5
-done
-
-# Kiểm tra xem bgutil server có còn chạy không
-if ! kill -0 $BGUTIL_PID 2>/dev/null; then
-    echo "⚠ WARNING: bgutil server process đã thoát. Kiểm tra log để biết lỗi."
-else
-    echo "✓ bgutil server đang chạy."
+if command -v node >/dev/null 2>&1 && [ -f /opt/bgutil/server/build/main.js ]; then
+    BGUTIL_PORT="${BGUTIL_PORT:-4416}"
+    node --max-old-space-size=64 /opt/bgutil/server/build/main.js --port "$BGUTIL_PORT" &
+    BGUTIL_PID=$!
+    trap 'kill "$BGUTIL_PID" 2>/dev/null || true' EXIT INT TERM
 fi
 
-echo "══════════════════════════════════════════════════════════════════"
-echo " Starting Telegram Bot (Python)..."
-echo "══════════════════════════════════════════════════════════════════"
-
-# Chạy Python bot
-exec python -u bot.py
+set +e
+python -u bot.py
+STATUS=$?
+set -e
+if [ -n "${BGUTIL_PID:-}" ]; then
+    kill "$BGUTIL_PID" 2>/dev/null || true
+fi
+exit "$STATUS"

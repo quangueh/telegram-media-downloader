@@ -20,10 +20,14 @@ import random
 import re
 import subprocess
 import time
+import threading
 from pathlib import Path
 
 import httpx
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont
+
+from config import MAX_PHOTO_FILE_SIZE
+from image_processor import open_safe_image
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CONFIG
@@ -55,8 +59,10 @@ def _load_bold_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
 #  TOOL 1: QR CODE
 # ═══════════════════════════════════════════════════════════════════════════════
 def generate_qr(text: str, output_path: str) -> str:
-    """Tạo QR code từ text/URL, trả về đường dẫn file PNG."""
     import qrcode
+
+    if not isinstance(text, str) or not text.strip() or len(text) > 2000:
+        raise ValueError("Nội dung QR không hợp lệ.")
 
     qr = qrcode.QRCode(
         version=None,  # Auto-fit độ lớn theo data
@@ -80,7 +86,7 @@ def make_sticker(input_path: str, output_path: str) -> str:
     - Resize giữ tỷ lệ, fit vào 512x512
     - Không crop — thêm padding trong suốt
     """
-    img = Image.open(input_path).convert("RGBA")
+    img = open_safe_image(input_path).convert("RGBA")
     img.thumbnail((512, 512), Image.LANCZOS)
 
     # Canvas trong suốt 512x512, ảnh căn giữa
@@ -102,22 +108,13 @@ def video_to_gif(
     duration: float = 5.0,
     on_progress=None,
 ) -> str:
-    """
-    Chuyển video → GIF bằng FFmpeg.
-    - Mặc định lấy 5 giây đầu
-    - 12fps, scale 480px width, palette-gen để GIF đẹp màu
-    - on_progress(pct, text) — optional, đọc từ -progress pipe
-    """
+    duration = max(0.5, min(float(duration), 30.0))
+    start = max(0.0, float(start))
     cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(start),
-        "-t", str(duration),
-        "-i", input_path,
-        "-vf",
-        "fps=12,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
-        "-progress", "pipe:1", "-nostats",
-        "-loglevel", "error",
-        output_path,
+        "ffmpeg", "-y", "-ss", str(start), "-t", str(duration), "-i", input_path,
+        "-vf", "fps=12,scale=480:-1:flags=lanczos,split[s0][s1];"
+        "[s0]palettegen[p];[s1][p]paletteuse",
+        "-progress", "pipe:1", "-nostats", "-loglevel", "error", output_path,
     ]
 
     def report(pct, text):
@@ -128,35 +125,59 @@ def video_to_gif(
                 pass
 
     report(2, "🎞️ Đang khởi động FFmpeg...")
-
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace",
-    )
+    proc = None
+    timer = None
+    output_tail: list[str] = []
     last_report_time = 0.0
     try:
-        # Đọc -progress pipe: các dòng key=value (out_time_us, out_time_ms, speed...)
-        for line in proc.stdout:
-            line = line.strip()
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+        )
+
+        def kill_process():
+            if proc and proc.poll() is None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+
+        timer = threading.Timer(120, kill_process)
+        timer.daemon = True
+        timer.start()
+        for raw_line in proc.stdout:
+            line = raw_line.strip()
+            if line:
+                output_tail.append(line)
+                if len(output_tail) > 20:
+                    output_tail.pop(0)
             if line.startswith("out_time_us="):
                 try:
                     out_us = int(line.split("=", 1)[1])
                     pct = min(99.0, out_us / (duration * 1_000_000) * 100)
-                    # Throttle: chỉ report khi >= 3% tiến bộ
                     now = time.monotonic()
                     if now - last_report_time >= 2.0:
                         last_report_time = now
-                        report(pct, f"🎞️ Đang chuyển: {pct:.0f}% ({duration}s)")
+                        report(pct, f"🎞️ Đang chuyển: {pct:.0f}%")
                 except ValueError:
                     pass
-        proc.wait(timeout=30)
+        proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError("FFmpeg lỗi: %s" % " ".join(output_tail)[-300:])
     except Exception:
-        proc.kill()
+        if proc and proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         raise
-
-    if proc.returncode != 0:
-        stderr = proc.stderr.read()[-300:] if proc.stderr else "unknown"
-        raise RuntimeError(f"FFmpeg lỗi: {stderr}")
+    finally:
+        if timer:
+            timer.cancel()
+        if proc and proc.stdout:
+            proc.stdout.close()
 
     report(100, "✅ Hoàn tất GIF")
     return output_path
@@ -175,7 +196,9 @@ def add_meme_text(
     Thêm text meme style (trắng + viền đen, UPPERCASE) lên ảnh.
     Text tự wrap nếu quá dài.
     """
-    img = Image.open(input_path).convert("RGB")
+    top_text = str(top_text or "")[:200]
+    bottom_text = str(bottom_text or "")[:200]
+    img = open_safe_image(input_path).convert("RGB")
     img.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
 
     draw = ImageDraw.Draw(img)
@@ -223,7 +246,6 @@ def add_meme_text(
 
     draw_text_block(top_text, 10, from_bottom=False)
     if bottom_text:
-        bbox = draw.textbbox((0, 0), "Ag", font=font)
         line_h = font_size + 8
         draw_text_block(bottom_text, img.height - 10 - line_h, from_bottom=True)
 
@@ -244,7 +266,9 @@ def compress_image(
     Nén ảnh: resize max width + JPEG quality thấp.
     Trả về (output_path, size_before, size_after) bytes.
     """
-    img = Image.open(input_path).convert("RGB")
+    quality = max(1, min(int(quality), 95))
+    max_width = max(64, min(int(max_width), MAX_DIMENSION))
+    img = open_safe_image(input_path).convert("RGB")
 
     # Resize nếu rộng hơn max_width
     if img.width > max_width:
@@ -266,7 +290,7 @@ def extract_colors(input_path: str, num_colors: int = 6) -> list[dict]:
     Trích xuất N màu chủ đạo từ ảnh.
     Trả về list dict: [{"hex": "#RRGGBB", "percent": 32.5}, ...]
     """
-    img = Image.open(input_path).convert("RGB")
+    img = open_safe_image(input_path).convert("RGB")
     img.thumbnail((200, 200))  # Giảm sample size cho nhanh
 
     # Quantize về num_colors palette
@@ -295,7 +319,8 @@ def add_watermark(
     text: str = "@MyBot",
 ) -> str:
     """Thêm watermark text semi-transparent ở góc dưới phải."""
-    img = Image.open(input_path).convert("RGBA")
+    text = str(text or "")[:200]
+    img = open_safe_image(input_path).convert("RGBA")
     img.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
 
     # Font size theo kích thước ảnh (2.5% width, min 14)
@@ -333,23 +358,32 @@ def add_watermark(
 #  TOOL 8: YOUTUBE THUMBNAIL
 # ══════════════════════════════════════════════════════════════════════════════════
 def get_youtube_thumbnail(video_id: str, output_path: str) -> str:
-    """
-    Tải thumbnail YouTube chất lượng cao nhất có thể.
-    Thử maxresdefault (1280x720) → fallback hqdefault (480x360).
-    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        raise ValueError("Video ID không hợp lệ.")
     urls = [
         f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
         f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
     ]
-    with httpx.Client(timeout=15, follow_redirects=True) as client:
+    with httpx.Client(timeout=15, follow_redirects=False) as client:
         for url in urls:
             try:
-                resp = client.get(url)
-                # Thumbnail thật ≥ 2KB; YouTube trả placeholder 1KB khi không có
-                if resp.status_code == 200 and len(resp.content) > 2000:
-                    Path(output_path).write_bytes(resp.content)
-                    return output_path
-            except httpx.HTTPError:
+                with client.stream("GET", url) as response:
+                    if response.status_code != 200:
+                        continue
+                    length = int(response.headers.get("content-length") or 0)
+                    if length > MAX_PHOTO_FILE_SIZE:
+                        continue
+                    chunks = []
+                    total = 0
+                    for chunk in response.iter_bytes():
+                        total += len(chunk)
+                        if total > MAX_PHOTO_FILE_SIZE:
+                            break
+                        chunks.append(chunk)
+                    if total > 2000 and total <= MAX_PHOTO_FILE_SIZE:
+                        Path(output_path).write_bytes(b"".join(chunks))
+                        return output_path
+            except (httpx.HTTPError, ValueError):
                 continue
     raise ValueError(f"Không tải được thumbnail cho video ID: {video_id}")
 
@@ -362,6 +396,8 @@ def parse_dice(expression: str = "1d6") -> tuple[int, int]:
     Parse cú pháp NdM (VD: 2d6, 1d20, 3d4, hoặc số trần "6" → 1d6).
     Trả về (count, sides) sau khi clamp giới hạn chống spam.
     """
+    if not isinstance(expression, str) or len(expression) > 32:
+        return 1, 6
     expr = expression.strip().lower().replace(" ", "")
 
     match = re.match(r"^(\d*)d(\d+)$", expr)
@@ -406,7 +442,12 @@ def image_to_ascii(input_path: str, width: int = 60) -> str:
     - Grayscale → map brightness → ASCII chars
     - width 60 chars (Telegram fit trong code block)
     """
-    img = Image.open(input_path).convert("L")
+    try:
+        width = int(width)
+    except (TypeError, ValueError):
+        width = 60
+    width = max(10, min(width, 120))
+    img = open_safe_image(input_path).convert("L")
 
     # Char cao gấp ~2x rộng → giảm height tương ứng
     aspect = img.height / img.width
@@ -430,17 +471,24 @@ def image_to_ascii(input_path: str, width: int = 60) -> str:
 #  EXTRACT YOUTUBE ID — helper cho /thumb
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_YT_ID_PATTERNS = [
-    r"(?:v=|/v/|/embed/|/shorts/)([A-Za-z0-9_-]{11})",
-    r"^([A-Za-z0-9_-]{11})$",
-    r"youtu\.be/([A-Za-z0-9_-]{11})",
-]
-
-
 def extract_youtube_id(url_or_id: str) -> str | None:
-    """Trích xuất video ID 11 ký tự từ URL YouTube hoặc ID trực tiếp."""
-    for pattern in _YT_ID_PATTERNS:
-        match = re.search(pattern, url_or_id.strip())
-        if match:
-            return match.group(1)
-    return None
+    from urllib.parse import parse_qs, urlsplit
+
+    value = url_or_id.strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", value):
+        return value
+    try:
+        parsed = urlsplit(value)
+        host = (parsed.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return None
+    if host in ("youtu.be", "www.youtu.be"):
+        candidate = parsed.path.strip("/").split("/", 1)[0]
+        return candidate if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate) else None
+    if host != "youtube.com" and not host.endswith(".youtube.com"):
+        return None
+    if parsed.path == "/watch":
+        candidate = parse_qs(parsed.query).get("v", [""])[0]
+        return candidate if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate) else None
+    match = re.match(r"^/(?:shorts|embed|v)/([A-Za-z0-9_-]{11})(?:/|$)", parsed.path)
+    return match.group(1) if match else None

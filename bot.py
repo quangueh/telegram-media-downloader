@@ -6,26 +6,48 @@ import random
 import threading
 import time
 import uuid
-from collections import deque
+import shutil
+from collections import deque, OrderedDict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from telegram import InputMediaPhoto, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     ApplicationBuilder,
+    AIORateLimiter,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
 
-from config import BOT_TOKEN, REQUEST_TIMEOUT, PORT, logger, DOWNLOAD_DIR
+from config import (
+    BOT_TOKEN,
+    REQUEST_TIMEOUT,
+    PORT,
+    ADMIN_USER_ID,
+    MAX_IMAGE_FILE_SIZE,
+    MAX_IMAGE_PIXELS,
+    MAX_PHOTO_FILE_SIZE,
+    MAX_FILE_SIZE,
+    MAX_AUDIO_FILE_SIZE,
+    MAX_CONCURRENT_JOBS,
+    MAX_PHOTO_COUNT,
+    MAX_TEXT_LENGTH,
+    USER_RATE_LIMIT_SECONDS,
+    logger,
+    DOWNLOAD_DIR,
+)
 from downloader import (
     extract_and_download,
+    validate_media_url,
+    cleanup_stale_jobs,
+    MediaFileTooLargeError,
     VideoTooLargeError,
     VideoDownloadError,
     YOUTUBE_PLAYER_CLIENTS,
 )
+from security import InvalidURL, redact_url
 from image_processor import enhance_image, beautify_image
 from progress import TelegramProgress
 from tools import (
@@ -42,13 +64,11 @@ from tools import (
     extract_youtube_id,
 )
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ADMIN — Theo dõi user nào gửi link nào
-# ═══════════════════════════════════════════════════════════════════════════════
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0") or "0")
-
-# Activity log: deque tự xóa cũ nhất, giữ tối đa 200 entries
-_activity_log: deque = deque(maxlen=200)
+_activity_log: deque[dict] = deque(maxlen=200)
+_download_slots = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+_request_times: OrderedDict[int, float] = OrderedDict()
+_bot_ready = threading.Event()
+_bot_shutdown = threading.Event()
 
 
 def _log_activity(
@@ -59,27 +79,52 @@ def _log_activity(
     platform: str,
     status: str,
 ) -> None:
-    """Ghi lại hoạt động gửi link của user."""
     _activity_log.append({
         "time": time.time(),
         "user_id": user_id,
         "username": username or "-",
         "name": first_name or "-",
-        "url": url[:80],
+        "url": redact_url(url)[:160],
         "platform": platform,
         "status": status,
     })
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  IMAGE PROCESSING — User mode tracking
-# ═══════════════════════════════════════════════════════════════════════════════
-# _user_mode[user_id] = mode string
-# Modes nhận ảnh: enhance, beautify, sticker, meme, compress, watermark, colors, ascii
-# _user_args[user_id] = dict các tham số tùy chọn (meme text, watermark text, ...)
-_user_mode: dict = {}
-_user_args: dict = {}
 
-# Regex phát hiện URL trong tin nhắn văn bản
+def _cleanup_path(path: str | Path | None) -> None:
+    if not path:
+        return
+    target = Path(path)
+    try:
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        else:
+            target.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _check_output_file(path: str, max_bytes: int, label: str) -> None:
+    size = os.path.getsize(path) if os.path.isfile(path) else max_bytes + 1
+    if size > max_bytes:
+        raise MediaFileTooLargeError(size, max_bytes, label)
+
+
+def _request_allowed(user_id: int) -> bool:
+    if USER_RATE_LIMIT_SECONDS <= 0:
+        return True
+    now = time.monotonic()
+    while _request_times and now - next(iter(_request_times.values())) > USER_RATE_LIMIT_SECONDS * 4:
+        _request_times.popitem(last=False)
+    previous = _request_times.get(user_id)
+    if previous is not None and now - previous < USER_RATE_LIMIT_SECONDS:
+        return False
+    _request_times[user_id] = now
+    _request_times.move_to_end(user_id)
+    while len(_request_times) > 10_000:
+        _request_times.popitem(last=False)
+    return True
+
+
 URL_REGEX = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
 
@@ -89,7 +134,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     greeting = (
         f"👋 Xin chào <b>{html.escape(user.first_name if user else 'Bạn')}</b>!\n\n"
         "🤖 Tôi là <b>Media Downloader Bot</b> chuyên:\n"
-        "• 🎵 <b>TikTok</b> (Tự động xóa Watermark / Logo)\n"
+        "• 🎵 <b>TikTok</b> (Video và album ảnh)\n"
         "• 📘 <b>Facebook</b> (Chất lượng HD cao nhất)\n"
         "• 📺 <b>YouTube</b> (Video kèm âm thanh đầy đủ)\n\n"
         "🖼️ <b>Xử lý ảnh:</b>\n"
@@ -120,7 +165,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     help_text = (
         "📖 <b>HƯỚNG DẪN SỬ DỤNG VÀ LƯU Ý</b>\n\n"
         "1️⃣ <b>Gửi link:</b> Gửi một tin nhắn chứa liên kết video từ TikTok, Facebook, YouTube hoặc các nền tảng được hỗ trợ.\n"
-        "2️⃣ <b>Xử lý tự động:</b> Bot sẽ trích xuất luồng video tốt nhất, dùng FFmpeg gộp âm thanh và loại bỏ watermark.\n"
+        "2️⃣ <b>Xử lý tự động:</b> Bot sẽ trích xuất luồng video phù hợp, dùng FFmpeg gộp âm thanh và chuẩn hóa codec.\n"
         "3️⃣ <b>Giới hạn:</b> Do chính sách của Telegram Bot API, các video có dung lượng trên <b>50MB</b> sẽ không thể gửi trực tiếp qua bot.\n"
         "4️⃣ <b>Quyền riêng tư:</b> Bot chỉ tải các video ở chế độ công khai (Public)."
     )
@@ -156,31 +201,36 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     success = sum(1 for e in _activity_log if e["status"] == "✅")
     failed = total - success
     lines = [
-        f"📊 <b>ADMIN DASHBOARD</b>",
-        f"━━━━━━━━━━━━━━━━━━━━",
+        "📊 <b>ADMIN DASHBOARD</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
         f"📥 Tổng requests: <b>{total}</b> | ✅ {success} | ❌ {failed}",
         f"👤 Users: <b>{len(users)}</b>",
         "",
-        f"👤 <b>DANH SÁCH USERS</b>",
-        f"━━━━━━━━━━━━━━━━━━━━",
+        "👤 <b>DANH SÁCH USERS</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
     ]
 
     for uid, info in sorted(users.items(), key=lambda x: -x[1]["count"]):
         uname = f"@{info['username']}" if info["username"] != "-" else f"ID: {uid}"
-        lines.append(f"• {info['name']} ({uname}) — <b>{info['count']}</b> link")
+        lines.append(
+            f"• {html.escape(str(info['name']))} ({html.escape(uname)}) — "
+            f"<b>{info['count']}</b> link"
+        )
 
     # 10 hoạt động gần nhất
     lines.append("")
-    lines.append(f"📜 <b>10 HOẠT ĐỘNG GẦN NHẤT</b>")
-    lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+    lines.append("📜 <b>10 HOẠT ĐỘNG GẦN NHẤT</b>")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
 
     for entry in list(_activity_log)[-10:][::-1]:
         t = time.strftime("%d/%m %H:%M", time.localtime(entry["time"]))
         uname = f"@{entry['username']}" if entry["username"] != "-" else f"ID:{entry['user_id']}"
         url_short = entry["url"][:50] + ("..." if len(entry["url"]) > 50 else "")
         lines.append(
-            f"{entry['status']} <code>{t}</code> {entry['name']} ({uname})\n"
-            f"  🌐 {entry['platform']} — <code>{html.escape(url_short)}</code>"
+            f"{entry['status']} <code>{t}</code> "
+            f"{html.escape(str(entry['name']))} ({html.escape(uname)})\n"
+            f"  🌐 {html.escape(str(entry['platform']))} — "
+            f"<code>{html.escape(url_short)}</code>"
         )
 
     text = "\n".join(lines)
@@ -200,8 +250,7 @@ async def enhance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """Kích hoạt chế độ làm nét — user gửi ảnh tiếp theo sẽ được xử lý."""
     if not update.message:
         return
-    user_id = update.effective_user.id
-    _user_mode[user_id] = "enhance"
+    context.user_data.update(mode="enhance", mode_at=time.monotonic())
     await update.message.reply_text(
         "🔍 <b>CHẾ ĐỘ LÀM NÉT ẢNH</b>\n\n"
         "📸 Gửi ảnh cần làm nét!\n"
@@ -215,8 +264,7 @@ async def beautify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Kích hoạt chế độ làm đẹp — user gửi ảnh tiếp theo sẽ được xử lý."""
     if not update.message:
         return
-    user_id = update.effective_user.id
-    _user_mode[user_id] = "beautify"
+    context.user_data.update(mode="beautify", mode_at=time.monotonic())
     await update.message.reply_text(
         "✨ <b>CHẾ ĐỘ LÀM ĐẸP ẢNH</b>\n\n"
         "📸 Gửi ảnh cần làm đẹp!\n"
@@ -230,10 +278,10 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Hủy chế độ xử lý ảnh."""
     if not update.message:
         return
-    user_id = update.effective_user.id
-    if user_id in _user_mode:
-        del _user_mode[user_id]
-        _user_args.pop(user_id, None)
+    if context.user_data.get("mode"):
+        context.user_data.pop("mode", None)
+        context.user_data.pop("mode_at", None)
+        context.user_data.pop("args", None)
         await update.message.reply_text("✅ Đã hủy chế độ hiện tại.")
     else:
         await update.message.reply_text("Không có chế độ nào đang hoạt động.")
@@ -259,9 +307,12 @@ async def qr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     text = " ".join(args)
+    if len(text) > min(MAX_TEXT_LENGTH, 2000):
+        await update.message.reply_text("❌ Nội dung QR quá dài.")
+        return
     output_path = str(DOWNLOAD_DIR / f"qr_{uuid.uuid4().hex[:8]}.png")
     try:
-        generate_qr(text, output_path)
+        await asyncio.to_thread(generate_qr, text, output_path)
         with open(output_path, "rb") as f:
             await update.message.reply_photo(
                 photo=f,
@@ -283,7 +334,7 @@ async def sticker_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     """TOOL 2: /sticker — gửi ảnh → nhận sticker 512x512."""
     if not update.message:
         return
-    _user_mode[update.effective_user.id] = "sticker"
+    context.user_data.update(mode="sticker", mode_at=time.monotonic())
     await update.message.reply_text(
         "🏷️ <b>STICKER MAKER</b>\n\n"
         "📸 Gửi ảnh để chuyển thành sticker 512x512!\n\n"
@@ -334,6 +385,8 @@ async def _process_gif(reply_msg, context: ContextTypes.DEFAULT_TYPE) -> None:
             video = reply_msg.document
         if video is None:
             raise ValueError("Không tìm thấy video để chuyển thành GIF")
+        if getattr(video, "file_size", None) and video.file_size > MAX_IMAGE_FILE_SIZE * 5:
+            raise MediaFileTooLargeError(video.file_size, MAX_IMAGE_FILE_SIZE * 5, "Video")
         tg_file = await context.bot.get_file(video.file_id)
         unique_id = uuid.uuid4().hex[:8]
         video_path = str(DOWNLOAD_DIR / f"gif_in_{unique_id}.mp4")
@@ -343,6 +396,10 @@ async def _process_gif(reply_msg, context: ContextTypes.DEFAULT_TYPE) -> None:
         await asyncio.to_thread(
             video_to_gif, video_path, gif_path, 0.0, 5.0, progress.update_sync
         )
+        if os.path.getsize(gif_path) > MAX_PHOTO_FILE_SIZE * 2:
+            raise MediaFileTooLargeError(
+                os.path.getsize(gif_path), MAX_PHOTO_FILE_SIZE * 2, "GIF",
+            )
 
         with open(gif_path, "rb") as f:
             await context.bot.send_animation(
@@ -380,6 +437,9 @@ async def meme_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message:
         return
     args = " ".join(context.args) if context.args else ""
+    if len(args) > MAX_TEXT_LENGTH:
+        await update.message.reply_text("❌ Nội dung meme quá dài.")
+        return
 
     if not args:
         await update.message.reply_text(
@@ -397,8 +457,8 @@ async def meme_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         top, bottom = args, ""
 
-    _user_mode[update.effective_user.id] = "meme"
-    _user_args[update.effective_user.id] = {
+    context.user_data.update(mode="meme", mode_at=time.monotonic())
+    context.user_data["args"] = {
         "top": top.strip(),
         "bottom": bottom.strip(),
     }
@@ -416,7 +476,7 @@ async def compress_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """TOOL 5: /compress — gửi ảnh → nén."""
     if not update.message:
         return
-    _user_mode[update.effective_user.id] = "compress"
+    context.user_data.update(mode="compress", mode_at=time.monotonic())
     await update.message.reply_text(
         "📦 <b>IMAGE COMPRESSOR</b>\n\n"
         "📸 Gửi ảnh cần nén (mặc định: max 1280px, quality 60%)!\n\n"
@@ -429,7 +489,7 @@ async def colors_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """TOOL 6: /colors — gửi ảnh → bảng màu chủ đạo."""
     if not update.message:
         return
-    _user_mode[update.effective_user.id] = "colors"
+    context.user_data.update(mode="colors", mode_at=time.monotonic())
     await update.message.reply_text(
         "🎨 <b>COLOR PALETTE</b>\n\n"
         "📸 Gửi ảnh cần phân tích màu!\n\n"
@@ -443,6 +503,9 @@ async def watermark_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not update.message:
         return
     args = " ".join(context.args) if context.args else ""
+    if len(args) > MAX_TEXT_LENGTH:
+        await update.message.reply_text("❌ Nội dung watermark quá dài.")
+        return
 
     if not args:
         await update.message.reply_text(
@@ -454,8 +517,8 @@ async def watermark_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    _user_mode[update.effective_user.id] = "watermark"
-    _user_args[update.effective_user.id] = {"text": args.strip()[:50]}
+    context.user_data.update(mode="watermark", mode_at=time.monotonic())
+    context.user_data["args"] = {"text": args.strip()[:50]}
     await update.message.reply_text(
         f"💧 <b>WATERMARK</b>\n\n"
         f"📝 Watermark: <b>{html.escape(args.strip()[:50])}</b>\n\n"
@@ -490,7 +553,12 @@ async def thumb_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     output_path = str(DOWNLOAD_DIR / f"thumb_{uuid.uuid4().hex[:8]}.jpg")
     try:
-        get_youtube_thumbnail(video_id, output_path)
+        await asyncio.to_thread(get_youtube_thumbnail, video_id, output_path)
+        if not os.path.exists(output_path) or os.path.getsize(output_path) > MAX_PHOTO_FILE_SIZE:
+            raise MediaFileTooLargeError(
+                os.path.getsize(output_path) if os.path.exists(output_path) else MAX_PHOTO_FILE_SIZE + 1,
+                MAX_PHOTO_FILE_SIZE, "Ảnh",
+            )
         with open(output_path, "rb") as f:
             await update.message.reply_photo(
                 photo=f,
@@ -559,7 +627,7 @@ async def ascii_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """TOOL 10: /ascii — gửi ảnh → ASCII art."""
     if not update.message:
         return
-    _user_mode[update.effective_user.id] = "ascii"
+    context.user_data.update(mode="ascii", mode_at=time.monotonic())
     await update.message.reply_text(
         "⌨️ <b>ASCII ART</b>\n\n"
         "📸 Gửi ảnh cần chuyển thành ASCII art!\n\n"
@@ -575,14 +643,23 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     user = update.effective_user
     user_id = user.id if user else 0
-    mode = _user_mode.get(user_id)
+    mode = context.user_data.get("mode")
+    mode_at = context.user_data.get("mode_at")
+    if mode and mode_at is not None and time.monotonic() - mode_at > 600:
+        context.user_data.pop("mode", None)
+        context.user_data.pop("mode_at", None)
+        context.user_data.pop("args", None)
+        mode = None
 
     if not mode:
-        return  # User không ở chế độ nào → bỏ qua
+        return
+    if not _request_allowed(user_id):
+        await update.message.reply_text("⏳ Bạn gửi yêu cầu quá nhanh. Vui lòng thử lại sau.")
+        return
 
-    # Xóa mode & args ngay sau khi nhận ảnh
-    del _user_mode[user_id]
-    args = _user_args.pop(user_id, {})
+    context.user_data.pop("mode", None)
+    context.user_data.pop("mode_at", None)
+    args = context.user_data.pop("args", {})
 
     chat_id = update.effective_chat.id
     input_path = None
@@ -612,6 +689,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         # Tải ảnh lớn nhất (photo[-1] là lớn nhất trong Telegram)
         photo = update.message.photo[-1]
+        if photo.width * photo.height > MAX_IMAGE_PIXELS:
+            raise ValueError("Ảnh có số lượng pixel vượt quá giới hạn.")
+        if photo.file_size and photo.file_size > MAX_IMAGE_FILE_SIZE:
+            raise MediaFileTooLargeError(photo.file_size, MAX_IMAGE_FILE_SIZE, "Ảnh đầu vào")
         photo_file = await context.bot.get_file(photo.file_id)
 
         unique_id = uuid.uuid4().hex[:8]
@@ -623,16 +704,19 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # ─── Xử lý theo từng mode ───────────────────────────────────────────
         if mode == "enhance":
             await asyncio.to_thread(enhance_image, input_path, output_path, progress.update_sync)
+            _check_output_file(output_path, MAX_PHOTO_FILE_SIZE, "Ảnh kết quả")
             with open(output_path, "rb") as f:
                 await context.bot.send_photo(chat_id=chat_id, photo=f, caption="🔍 Ảnh đã được làm nét!")
 
         elif mode == "beautify":
             await asyncio.to_thread(beautify_image, input_path, output_path, progress.update_sync)
+            _check_output_file(output_path, MAX_PHOTO_FILE_SIZE, "Ảnh kết quả")
             with open(output_path, "rb") as f:
                 await context.bot.send_photo(chat_id=chat_id, photo=f, caption="✨ Ảnh đã được làm đẹp!")
 
         elif mode == "sticker":
             await asyncio.to_thread(make_sticker, input_path, output_path)
+            _check_output_file(output_path, MAX_PHOTO_FILE_SIZE, "Ảnh kết quả")
             with open(output_path, "rb") as f:
                 await context.bot.send_sticker(chat_id=chat_id, sticker=f)
 
@@ -640,6 +724,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             top = args.get("top", "")
             bottom = args.get("bottom", "")
             await asyncio.to_thread(add_meme_text, input_path, output_path, top, bottom)
+            _check_output_file(output_path, MAX_PHOTO_FILE_SIZE, "Ảnh kết quả")
             with open(output_path, "rb") as f:
                 await context.bot.send_photo(chat_id=chat_id, photo=f, caption="😂 Meme đã sẵn sàng!")
 
@@ -648,6 +733,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 compress_image, input_path, output_path,
             )
             saved_pct = round((1 - size_after / size_before) * 100, 1) if size_before else 0
+            _check_output_file(output_path, MAX_PHOTO_FILE_SIZE, "Ảnh kết quả")
             with open(output_path, "rb") as f:
                 await context.bot.send_photo(
                     chat_id=chat_id, photo=f,
@@ -661,6 +747,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         elif mode == "watermark":
             wm_text = args.get("text", "@MyBot")
             await asyncio.to_thread(add_watermark, input_path, output_path, wm_text)
+            _check_output_file(output_path, MAX_PHOTO_FILE_SIZE, "Ảnh kết quả")
             with open(output_path, "rb") as f:
                 await context.bot.send_photo(
                     chat_id=chat_id, photo=f,
@@ -724,21 +811,43 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     match = URL_REGEX.search(text)
     if not match:
         return
+    url = match.group(0).rstrip(".,!?;:]}\"")
+    user = update.effective_user
+    user_id = user.id if user else 0
+    try:
+        url = await asyncio.to_thread(validate_media_url, url)
+    except InvalidURL as exc:
+        await update.message.reply_text(
+            f"⛔ URL không được phép: {html.escape(str(exc))}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if not _request_allowed(user_id):
+        await update.message.reply_text("⏳ Bạn gửi yêu cầu quá nhanh. Vui lòng thử lại sau.")
+        return
 
-    url = match.group(0)
+    try:
+        await asyncio.wait_for(_download_slots.acquire(), timeout=0.25)
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⏳ Hệ thống đang xử lý các yêu cầu khác. Vui lòng thử lại sau.")
+        return
+
+    job_acquired = True
     chat_id = update.effective_chat.id
     progress = None
     downloaded_files: list = []
+    cleanup_dir = None
+    result = None
 
-    # Xác định nền tảng
-    user = update.effective_user
-    if "tiktok.com" in url.lower() or "vm.tiktok.com" in url.lower():
+    from urllib.parse import urlsplit
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    if host == "tiktok.com" or host.endswith(".tiktok.com"):
         platform = "TikTok"
-    elif "douyin.com" in url.lower() or "iesdouyin.com" in url.lower():
+    elif host == "douyin.com" or host.endswith(".douyin.com") or host == "iesdouyin.com" or host.endswith(".iesdouyin.com"):
         platform = "Douyin"
-    elif "youtube.com" in url.lower() or "youtu.be" in url.lower():
+    elif host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be" or host.endswith(".youtu.be"):
         platform = "YouTube"
-    elif "facebook.com" in url.lower() or "fb.watch" in url.lower():
+    elif host == "facebook.com" or host.endswith(".facebook.com") or host == "fb.watch" or host.endswith(".fb.watch"):
         platform = "Facebook"
     else:
         platform = "Other"
@@ -761,6 +870,7 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             progress.update_sync(pct, text)
 
         result = await extract_and_download(url, progress_cb=_dl_progress)
+        cleanup_dir = getattr(result, "cleanup_dir", None)
         downloaded_files = list(result.paths)
         if getattr(result, "audio", None):
             downloaded_files.append(result.audio)
@@ -775,39 +885,42 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # ── TikTok PHOTO POST: gửi album ảnh ──
         if result.kind == "photos":
+            if len(result.paths) > MAX_PHOTO_COUNT:
+                raise VideoDownloadError("Album vượt quá số lượng ảnh được phép.")
+            for path in result.paths:
+                _check_output_file(path, MAX_PHOTO_FILE_SIZE, "Ảnh")
             try:
                 await progress.finish("🖼️ <b>Đang tải ảnh lên Telegram...</b>")
             except Exception:
                 pass
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
-
-            # Media group tối đa 10 ảnh/group → chia batch
-            handles = []
-            try:
-                batch = []
-                for idx, path in enumerate(result.paths):
-                    fh = open(path, "rb")
-                    handles.append(fh)
-                    if idx == 0:
-                        batch.append(InputMediaPhoto(fh, caption=caption, parse_mode=ParseMode.HTML))
-                    else:
-                        batch.append(InputMediaPhoto(fh))
-                    if len(batch) == 10:
-                        await context.bot.send_media_group(chat_id=chat_id, media=batch)
-                        batch = []
-                if batch:
+            for batch_start in range(0, len(result.paths), 10):
+                batch_paths = result.paths[batch_start:batch_start + 10]
+                handles = []
+                try:
+                    batch = []
+                    for path in batch_paths:
+                        file_handle = open(path, "rb")
+                        handles.append(file_handle)
+                        if batch_start == 0 and not batch:
+                            batch.append(InputMediaPhoto(
+                                file_handle, caption=caption, parse_mode=ParseMode.HTML,
+                            ))
+                        else:
+                            batch.append(InputMediaPhoto(file_handle))
                     await context.bot.send_media_group(chat_id=chat_id, media=batch)
-            finally:
-                for fh in handles:
-                    try:
-                        fh.close()
-                    except Exception:
-                        pass
+                finally:
+                    for file_handle in handles:
+                        file_handle.close()
 
             # Gửi kèm nhạc nền (photo post TikTok có music) nếu tải được
             audio = getattr(result, "audio", None)
             if audio and os.path.exists(audio):
                 try:
+                    if os.path.getsize(audio) > MAX_AUDIO_FILE_SIZE:
+                        raise MediaFileTooLargeError(
+                            os.path.getsize(audio), MAX_AUDIO_FILE_SIZE, "Audio",
+                        )
                     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_AUDIO)
                     with open(audio, "rb") as af:
                         await context.bot.send_audio(
@@ -820,13 +933,17 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     logger.warning(f"Gửi nhạc nền TikTok fail: {e}")
         else:
             # ── VIDEO: gửi video như bình thường ──
-            # Cập nhật trạng thái đang upload
+            video_path = downloaded_files[0]
+            if not os.path.isfile(video_path) or os.path.getsize(video_path) > MAX_FILE_SIZE:
+                raise MediaFileTooLargeError(
+                    os.path.getsize(video_path) if os.path.isfile(video_path) else MAX_FILE_SIZE + 1,
+                    MAX_FILE_SIZE, "Video",
+                )
             try:
                 await progress.finish("🚀 <b>Đang tải video lên Telegram...</b>")
             except Exception:
                 pass
-
-            with open(downloaded_files[0], "rb") as video_file:
+            with open(video_path, "rb") as video_file:
                 await context.bot.send_video(
                     chat_id=chat_id,
                     video=video_file,
@@ -853,7 +970,7 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
     except VideoTooLargeError as e:
-        logger.warning(f"File quá lớn khi tải {url}: {e}")
+        logger.warning("File quá lớn khi tải %s: %s", redact_url(url), e)
         _log_activity(
             user_id=user.id if user else 0,
             username=user.username if user else "",
@@ -870,22 +987,17 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await update.message.reply_text(error_text, parse_mode=ParseMode.HTML)
 
     except VideoDownloadError as e:
-        logger.error(f"Lỗi tải video {url}: {e}")
+        logger.error("Lỗi tải video %s: %s", redact_url(url), e)
         _log_activity(
             user_id=user.id if user else 0,
             username=user.username if user else "",
             first_name=user.first_name if user else "",
             url=url, platform=platform, status="❌ Lỗi",
         )
-        # Hiển thị phần lỗi gốc để người dùng và dev biết nguyên nhân thật (IP bị chặn, extractor lỗi...)
-        reason = str(e).replace("Lỗi tải video từ nền tảng: ", "").strip()
-        if len(reason) > 300:
-            reason = reason[:300] + "..."
         error_text = (
             "❌ <b>Không thể tải video từ liên kết này!</b>\n\n"
-            f"<i>Chi tiết: {html.escape(reason)}</i>\n\n"
             "Vui lòng kiểm tra lại:\n"
-            "• Đảm bảo liên kết chính xác và có thể truy cập công khai.\n"
+            "• Liên kết đúng và video ở chế độ công khai.\n"
             "• Video không bị khóa riêng tư hoặc giới hạn độ tuổi."
         )
         if progress and progress._message:
@@ -905,19 +1017,23 @@ async def handle_video_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await update.message.reply_text(error_text)
 
     finally:
-        # Tự động dọn dẹp file tạm thời để tránh tràn dung lượng ổ đĩa
         for tmp_file in downloaded_files:
-            if tmp_file and os.path.exists(tmp_file):
-                try:
-                    os.remove(tmp_file)
-                    logger.info(f"Đã dọn dẹp file tạm thành công: {tmp_file}")
-                except OSError as cleanup_err:
-                    logger.warning(f"Không thể xóa file tạm {tmp_file}: {cleanup_err}")
+            _cleanup_path(tmp_file)
+        if cleanup_dir:
+            _cleanup_path(cleanup_dir)
+        if job_acquired:
+            _download_slots.release()
 
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Bắt các lỗi ngoại lệ toàn cục để ngăn bot crash."""
-    logger.error("Ngoại lệ phát sinh khi xử lý update:", exc_info=context.error)
+    error = context.error
+    if isinstance(error, BaseException):
+        logger.error(
+            "Ngoại lệ phát sinh khi xử lý update:",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+    else:
+        logger.error("Ngoại lệ phát sinh khi xử lý update: %s", error)
 
 
 def log_build_info() -> None:
@@ -944,20 +1060,32 @@ def log_build_info() -> None:
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
-    """Handler phục vụ health check HTTP của Render để giữ bot hoạt động."""
+    def _status_for_path(self) -> tuple[int, bytes]:
+        path = self.path.split("?", 1)[0]
+        if path in ("/ready", "/readyz", "/healthz"):
+            if _bot_ready.is_set():
+                return 200, b"ready"
+            return 503, b"not ready"
+        if path in ("/", "/health", "/livez"):
+            return 200, b"Telegram Media Downloader Bot is running OK!"
+        return 404, b"not found"
+
     def do_GET(self) -> None:
-        self.send_response(200)
+        status, body = self._status_for_path()
+        self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b"Telegram Media Downloader Bot is running OK!")
+        self.wfile.write(body)
 
     def do_HEAD(self) -> None:
-        self.send_response(200)
+        status, _ = self._status_for_path()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
 
     def log_message(self, format: str, *args: object) -> None:
-        # Giảm thiểu ghi log định kỳ của health check
-        pass
+        return
 
 
 # Render gán URL public qua biến RENDER_EXTERNAL_URL
@@ -1003,6 +1131,16 @@ def start_health_check_server(port: int) -> None:
         logger.warning(f"Không thể khởi chạy Health-check server trên cổng {port}: {e}")
 
 
+async def _mark_application_ready(application) -> None:
+    _bot_shutdown.clear()
+    _bot_ready.set()
+
+
+async def _mark_application_stopped(application) -> None:
+    _bot_ready.clear()
+    _bot_shutdown.set()
+
+
 def main() -> None:
     """Điểm khởi chạy chính của Telegram Bot."""
     if not BOT_TOKEN:
@@ -1014,10 +1152,11 @@ def main() -> None:
         print("👉 Vui lòng tạo file .env với nội dung: BOT_TOKEN=your_token_here")
         print("   Hoặc chạy: export BOT_TOKEN='your_token_here'")
         print("=======================================================\n")
-        return
+        raise SystemExit(1)
 
     logger.info("Đang khởi động Telegram Media Downloader Bot...")
     log_build_info()
+    cleanup_stale_jobs()
 
     # Khởi chạy máy chủ HTTP Health Check nếu phát hiện biến PORT (Render Web Service)
     if PORT > 0:
@@ -1026,7 +1165,16 @@ def main() -> None:
     application = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
+        .rate_limiter(AIORateLimiter(
+            overall_max_rate=0.5,
+            overall_time_period=1.0,
+            group_max_rate=10,
+            group_time_period=60.0,
+            max_retries=2,
+        ))
         .concurrent_updates(True)
+        .post_init(_mark_application_ready)
+        .post_shutdown(_mark_application_stopped)
         .build()
     )
 

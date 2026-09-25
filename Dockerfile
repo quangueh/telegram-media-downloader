@@ -1,41 +1,31 @@
 FROM python:3.11-slim
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ENV
-# ═══════════════════════════════════════════════════════════════════════════════
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
     DOWNLOAD_DIR=/app/downloads
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  STEP 1: FFmpeg only (Render free tier 512MB — không đủ cho Node.js + Python)
-# ═══════════════════════════════════════════════════════════════════════════════
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
     ca-certificates \
+    ffmpeg \
+    tini \
     && rm -rf /var/lib/apt/lists/*
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  STEP 2: Python deps
-# ═══════════════════════════════════════════════════════════════════════════════
 WORKDIR /app
+COPY requirements.txt ./
+RUN python -m pip install --no-cache-dir -r requirements.txt
 
-ARG BUILD_DATE
-LABEL build_date=$BUILD_DATE
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /app/downloads \
+    && chown -R appuser:appuser /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir --upgrade -r requirements.txt \
-    && pip install --no-cache-dir --upgrade yt-dlp
+COPY --chown=appuser:appuser . .
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  STEP 3: Copy source
-# ═══════════════════════════════════════════════════════════════════════════════
-COPY . .
+USER appuser
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD-SHELL python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.getenv('PORT', '8080') + '/health', timeout=3)" || exit 1
 
-RUN mkdir -p /app/downloads
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CMD
-# ═══════════════════════════════════════════════════════════════════════════════
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python", "-u", "bot.py"]
